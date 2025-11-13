@@ -5,6 +5,7 @@ on:
     branches:
       - 'main'
       - 'release-*'
+      - 'datadog'
     paths-ignore:
       - '.autocorrectrc'
       - '.markdownlint-cli2.jsonc'
