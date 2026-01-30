@@ -1711,23 +1711,9 @@ func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		if count != nil {
 			atomic.AddUint64(count, uint64(inodes))
 		}
-	} else if st == syscall.ENOTSUP {
-		// Fallback: Call back to high-level Clone() for each entry
-		// This preserves the existing concurrency behavior
-		for _, e := range entries {
-			if ctx.Canceled() {
-				return syscall.EINTR
-			}
-			var total uint64
-			if st := m.Clone(ctx, srcParent, e.Inode, dstParent, string(e.Name), cmode, cumask, count, &total); st != 0 && st != syscall.ENOENT {
-				return st
-			}
-		}
-		st = 0
-	} else if st != 0 {
-		return st
 	}
-	return 0
+	// Just return the status - let caller handle ENOTSUP
+	return st
 }
 
 func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
@@ -3304,7 +3290,31 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 
 		// Batch clone all non-directory entries from this batch
 		if len(nonDirEntries) > 0 {
-			if eno = m.BatchClone(ctx, srcIno, ino, nonDirEntries, cmode, cumask, count); eno != 0 {
+			if eno = m.BatchClone(ctx, srcIno, ino, nonDirEntries, cmode, cumask, count); eno == syscall.ENOTSUP {
+				// Fallback: clone each file concurrently (same pattern as directories)
+				for _, e := range nonDirEntries {
+					select {
+					case concurrent <- struct{}{}:
+						wg.Add(1)
+						go func(entry *Entry) {
+							defer wg.Done()
+							childEno := cloneChild(entry)
+							if childEno != 0 {
+								errCh <- childEno
+							}
+							<-concurrent
+						}(e)
+					default:
+						// Synchronous fallback when channel is full
+						if childEno := cloneChild(e); childEno != 0 {
+							eno = childEno
+							goto END
+						}
+					}
+				}
+				// Reset error after spawning goroutines - errors will be reported via errCh
+				eno = 0
+			} else if eno != 0 {
 				goto END
 			}
 		}
