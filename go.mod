@@ -99,7 +99,7 @@ require (
 	google.golang.org/api v0.210.0
 	google.golang.org/protobuf v1.36.3
 	gopkg.in/kothar/go-backblaze.v0 v0.0.0-20210124194846-35409b867216
-	pgregory.net/rapid v0.5.3
+	pgregory.net/rapid v1.2.0
 	xorm.io/xorm v1.0.7
 )
 
