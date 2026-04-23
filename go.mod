@@ -1,6 +1,6 @@
 module github.com/juicedata/juicefs
 
-go 1.23.0
+go 1.25.0
 
 require (
 	cloud.google.com/go/compute/metadata v0.5.2
@@ -27,7 +27,7 @@ require (
 	github.com/davies/groupcache v0.0.0-20230821031435-e4e8362f58e1
 	github.com/dgraph-io/badger/v4 v4.5.1
 	github.com/dustin/go-humanize v1.0.1
-	github.com/emmansun/gmsm v0.34.1
+	github.com/emmansun/gmsm v0.42.0
 	github.com/erikdubbelboer/gspt v0.0.0-20210805194459-ce36a5128377
 	github.com/go-http-utils/headers v0.0.0-20181008091004-fed159eddc2a
 	github.com/go-sql-driver/mysql v1.9.1
@@ -89,13 +89,13 @@ require (
 	go.etcd.io/etcd/client/v3 v3.5.9
 	go.uber.org/automaxprocs v1.6.0
 	go.uber.org/zap v1.24.0
-	golang.org/x/crypto v0.41.0
-	golang.org/x/net v0.42.0
+	golang.org/x/crypto v0.50.0
+	golang.org/x/net v0.52.0
 	golang.org/x/oauth2 v0.24.0
-	golang.org/x/sync v0.16.0
-	golang.org/x/sys v0.35.0
-	golang.org/x/term v0.34.0
-	golang.org/x/text v0.28.0
+	golang.org/x/sync v0.20.0
+	golang.org/x/sys v0.43.0
+	golang.org/x/term v0.42.0
+	golang.org/x/text v0.36.0
 	google.golang.org/api v0.210.0
 	google.golang.org/protobuf v1.36.3
 	gopkg.in/kothar/go-backblaze.v0 v0.0.0-20210124194846-35409b867216
@@ -309,9 +309,9 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/arch v0.11.0 // indirect
 	golang.org/x/exp v0.0.0-20240119083558-1b970713d09a // indirect
-	golang.org/x/mod v0.26.0 // indirect
+	golang.org/x/mod v0.34.0 // indirect
 	golang.org/x/time v0.8.0 // indirect
-	golang.org/x/tools v0.35.0 // indirect
+	golang.org/x/tools v0.43.0 // indirect
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 	google.golang.org/genproto v0.0.0-20241118233622-e639e219e697 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20241113202542-65e8d215514f // indirect
