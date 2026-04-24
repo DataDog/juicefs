@@ -264,7 +264,7 @@
 		<dependency>
 			<groupId>com.github.jnr</groupId>
 			<artifactId>jnr-ffi</artifactId>
-			<version>2.2.12</version>
+			<version>2.2.19</version>
 		</dependency>
 		<dependency>
 			<groupId>org.apache.hadoop</groupId>
@@ -299,12 +299,12 @@
 		<dependency>
 			<groupId>org.javassist</groupId>
 			<artifactId>javassist</artifactId>
-			<version>3.25.0-GA</version>
+			<version>3.30.2-GA</version>
 		</dependency>
 		<dependency>
 			<groupId>com.beust</groupId>
 			<artifactId>jcommander</artifactId>
-			<version>1.81</version>
+			<version>1.82</version>
 		</dependency>
 		<dependency>
 			<groupId>org.apache.hive</groupId>
@@ -335,7 +335,7 @@
 		<dependency>
 			<groupId>com.google.guava</groupId>
 			<artifactId>guava</artifactId>
-			<version>32.0.1-jre</version>
+			<version>32.1.3-jre</version>
 		</dependency>
 		<dependency>
 			<groupId>org.apache.hadoop</groupId>
@@ -369,7 +369,7 @@
 		<dependency>
 			<groupId>org.apache.ranger</groupId>
 			<artifactId>ranger-plugins-common</artifactId>
-			<version>2.3.0</version>
+			<version>2.8.0</version>
 			<exclusions>
 				<exclusion>
 					<groupId>*</groupId>
@@ -380,12 +380,12 @@
 		<dependency>
 			<groupId>com.kstruct</groupId>
 			<artifactId>gethostname4j</artifactId>
-			<version>0.0.2</version>
+			<version>0.0.3</version>
 		</dependency>
 		<dependency>
 			<groupId>com.sun.jersey</groupId>
 			<artifactId>jersey-bundle</artifactId>
-			<version>1.19.3</version>
+			<version>1.19.4</version>
 		</dependency>
 		<dependency>
 			<groupId>org.codehaus.jackson</groupId>
@@ -395,7 +395,7 @@
 		<dependency>
 			<groupId>org.apache.ranger</groupId>
 			<artifactId>ranger-plugins-audit</artifactId>
-			<version>2.3.0</version>
+			<version>2.6.0</version>
 			<exclusions>
 				<exclusion>
 					<groupId>*</groupId>
