@@ -63,7 +63,7 @@ public class RangerPermissionChecker {
   private final FileSystem superGroupFileSystem;
   private final RangerJfsPlugin rangerPlugin;
 
-  private RangerPermissionChecker(FileSystem superGroupFileSystem, RangerConfig config) {
+  public RangerPermissionChecker(FileSystem superGroupFileSystem, RangerConfig config) {
     this.superGroupFileSystem = superGroupFileSystem;
     rangerPlugin = new RangerJfsPlugin(superGroupFileSystem, config.getServiceName(), config.getRangerRestUrl(), config.getPollIntervalMs());
     rangerPlugin.getConfig().set("ranger.plugin.hdfs.service.name", config.getServiceName());
@@ -267,16 +267,15 @@ public class RangerPermissionChecker {
   }
 
   public FileStatus getAncestor(Path path) throws IOException {
-    if (path.getParent() != null) {
-      return getIfExist(path.getParent());
+    Path parent = path.getParent();
+    while (parent != null) {
+      FileStatus status = getIfExist(parent);
+      if (status != null) {
+        return status;
+      }
+      parent = parent.getParent();
     }
-    path = path.getParent();
-    FileStatus tmp = null;
-    while (path != null && tmp == null) {
-      tmp = getIfExist(path);
-      path = path.getParent();
-    }
-    return tmp;
+    return null;
   }
 
   public static class PathObj {

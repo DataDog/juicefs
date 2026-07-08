@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -81,8 +82,10 @@ func rmr(ctx *cli.Context) error {
 		numThreads = 255
 	}
 	if ctx.Bool("skip-trash") {
-		if os.Getuid() != 0 {
+		if runtime.GOOS != "windows" && os.Getuid() != 0 {
 			logger.Fatalf("Only root can remove files directly")
+		} else if runtime.GOOS == "windows" && !utils.IsWinAdminOrElevatedPrivilege() {
+			logger.Fatalf("Removing files directly requires Administrator or elevated privilege on Windows")
 		}
 		flag = 1
 	}
@@ -92,7 +95,7 @@ func rmr(ctx *cli.Context) error {
 		path := ctx.Args().Get(i)
 		p, err := filepath.Abs(path)
 		if err != nil {
-			logger.Errorf("abs of %s: %s", path, err)
+			logger.Errorf("abs of %q: %s", path, err)
 			continue
 		}
 		d := filepath.Dir(p)
@@ -103,7 +106,7 @@ func rmr(ctx *cli.Context) error {
 		}
 		f, err := openController(d)
 		if err != nil {
-			logger.Errorf("Open control file for %s: %s", d, err)
+			logger.Errorf("Open control file for %q: %s", d, err)
 			continue
 		}
 		wb := utils.NewBuffer(8 + 8 + 1 + uint32(len(name)) + 1 + 1)
@@ -121,7 +124,7 @@ func rmr(ctx *cli.Context) error {
 		if _, errno := readProgress(f, func(count, bytes uint64) {
 			spin.SetCurrent(int64(count))
 		}); errno != 0 {
-			logger.Fatalf("RMR %s: %s", path, errno)
+			logger.Fatalf("RMR %q: %s", path, errno)
 		}
 		_ = f.Close()
 	}

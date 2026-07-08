@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	_ "net/http/pprof"
@@ -155,7 +156,7 @@ func selectionFlags() []cli.Flag {
 		&cli.BoolFlag{
 			Name:    "update",
 			Aliases: []string{"u"},
-			Usage:   "skip files if the destination is newer",
+			Usage:   "update existing files only when the source mtime is newer; ignore size differences",
 		},
 		&cli.BoolFlag{
 			Name:    "force-update",
@@ -203,6 +204,10 @@ func syncActionFlags() []cli.Flag {
 			Usage:   "delete objects from source those already exist in destination",
 		},
 		&cli.BoolFlag{
+			Name:  "delete-src-after",
+			Usage: "delete the source object after successful processing",
+		},
+		&cli.BoolFlag{
 			Name:    "delete-dst",
 			Aliases: []string{"deleteDst"},
 			Usage:   "delete extraneous objects from destination",
@@ -231,6 +236,19 @@ func syncActionFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "mountpoint",
 			Usage: "the mount point for current volume (to follow symlink)",
+		},
+		&cli.BoolFlag{
+			Name:  "enable-checkpoint",
+			Usage: "enable checkpoint for resumable sync",
+		},
+		&cli.BoolFlag{
+			Name:  "checkpoint-force-reset",
+			Usage: "start from scratch and overwrite existing checkpoint",
+		},
+		&cli.StringFlag{
+			Name:  "checkpoint-interval",
+			Value: "10s",
+			Usage: "interval to save checkpoint (default: 10s)",
 		},
 	})
 }
@@ -264,6 +282,28 @@ func syncStorageFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "bwlimit",
 			Usage: "limit bandwidth in Mbps (0 means unlimited)",
+		},
+		&cli.StringFlag{
+			Name:  "traffic-control-url",
+			Usage: "the url of the traffic control",
+		},
+		&cli.StringFlag{
+			Name:  "encrypt-rsa-key",
+			Usage: "path to RSA/SM2 private key (PEM) for encrypting destination",
+		},
+		&cli.StringFlag{
+			Name:  "decrypt-rsa-key",
+			Usage: "path to RSA/SM2 private key (PEM) for decrypting source",
+		},
+		&cli.StringFlag{
+			Name:  "encrypt-algo",
+			Value: object.AES256GCM_RSA,
+			Usage: "encrypt algorithm (aes256gcm-rsa, chacha20-rsa, sm4gcm)",
+		},
+		&cli.StringFlag{
+			Name:  "decrypt-algo",
+			Value: object.AES256GCM_RSA,
+			Usage: "decrypt algorithm (aes256gcm-rsa, chacha20-rsa, sm4gcm)",
 		},
 	})
 }
@@ -328,10 +368,10 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 		if isFilePath(uri) {
 			absPath, err := filepath.Abs(uri)
 			if err != nil {
-				logger.Fatalf("invalid path: %s", err.Error())
+				logger.Fatalf("invalid path %q: %s", uri, err.Error())
 			}
 			if !strings.HasPrefix(absPath, "/") { // Windows path
-				absPath = "/" + strings.Replace(absPath, "\\", "/", -1)
+				absPath = "/" + strings.ReplaceAll(absPath, "\\", "/")
 			}
 			if strings.HasSuffix(uri, "/") {
 				absPath += "/"
@@ -358,7 +398,7 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 	uri, token := extractToken(uri)
 	u, err := url.Parse(uri)
 	if err != nil {
-		logger.Fatalf("Can't parse %s: %s", uri, err.Error())
+		logger.Fatalf("Can't parse %q: %s", utils.RemovePassword(uri), utils.RemovePassword(err.Error()))
 	}
 	user := u.User
 	var accessKey, secretKey string
@@ -412,14 +452,14 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 
 	if conf.Links {
 		if _, ok := store.(object.SupportSymlink); !ok {
-			logger.Warnf("storage %s does not support symlink, ignore it", uri)
+			logger.Warnf("storage %q does not support symlink, ignore it", utils.RemovePassword(uri))
 			conf.Links = false
 		}
 	}
 
 	if conf.Perms {
 		if _, ok := store.(object.FileSystem); !ok {
-			logger.Warnf("%s is not a file system, can not preserve permissions", store)
+			logger.Warnf("%q is not a file system, can not preserve permissions", store)
 			conf.Perms = false
 		}
 	}
@@ -441,7 +481,11 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 			store = object.WithPrefix(store, u.Path[1:])
 		}
 	}
-
+	if os, ok := store.(object.SupportTier); ok {
+		if err := os.InitTiers(object.NewTiers("")); err != nil {
+			logger.Warnf("Set storage tier: %s", err)
+		}
+	}
 	return store, nil
 }
 
@@ -449,6 +493,27 @@ func isS3PathType(endpoint string) bool {
 	//localhost[:8080] 127.0.0.1[:8080]  s3.ap-southeast-1.amazonaws.com[:8080] s3-ap-southeast-1.amazonaws.com[:8080]
 	pattern := `^((localhost)|(s3[.-].*\.amazonaws\.com)|((1\d{2}|2[0-4]\d|25[0-5]|[1-9]\d|[1-9])\.((1\d{2}|2[0-4]\d|25[0-5]|[1-9]\d|\d)\.){2}(1\d{2}|2[0-4]\d|25[0-5]|[1-9]\d|\d)))?(:\d*)?$`
 	return regexp.MustCompile(pattern).MatchString(endpoint)
+}
+
+func wrapSyncEncryptedStore(store object.ObjectStorage, keyPath, passphraseEnv, mode, algo string) (object.ObjectStorage, error) {
+	if keyPath == "" {
+		return store, nil
+	}
+
+	privKey, err := object.ParseRsaPrivateKeyFromPath(keyPath, os.Getenv(passphraseEnv))
+	if err != nil {
+		if errors.Is(err, object.ErrKeyNeedPasswd) {
+			logger.Fatalf("%s key is password protected, please set %s environment variable", mode, passphraseEnv)
+		}
+		return nil, fmt.Errorf("load %s key: %w", mode, err)
+	}
+
+	encryptor, err := object.NewDataEncryptor(object.NewKeyEncryptor(privKey), algo)
+	if err != nil {
+		return nil, fmt.Errorf("create %sor: %w", mode, err)
+	}
+
+	return object.NewChunkedEncrypted(store, encryptor), nil
 }
 
 func doSync(c *cli.Context) error {
@@ -467,10 +532,10 @@ func doSync(c *cli.Context) error {
 	removePassword(srcURL, dstURL)
 	if runtime.GOOS == "windows" {
 		if !strings.Contains(srcURL, "://") {
-			srcURL = strings.Replace(srcURL, "\\", "/", -1)
+			srcURL = strings.ReplaceAll(srcURL, "\\", "/")
 		}
 		if !strings.Contains(dstURL, "://") {
-			dstURL = strings.Replace(dstURL, "\\", "/", -1)
+			dstURL = strings.ReplaceAll(dstURL, "\\", "/")
 		}
 	}
 	if strings.HasSuffix(srcURL, "/") != strings.HasSuffix(dstURL, "/") {
@@ -489,12 +554,20 @@ func doSync(c *cli.Context) error {
 		object.Shutdown(dst)
 	}()
 	if config.StorageClass != "" {
-		if os, ok := dst.(object.SupportStorageClass); ok {
-			err := os.SetStorageClass(config.StorageClass)
-			if err != nil {
-				logger.Errorf("set storage class %s: %s", config.StorageClass, err)
+		if os, ok := dst.(object.SupportTier); ok {
+			tiers := object.NewTiers(config.StorageClass)
+			if err := os.InitTiers(tiers); err != nil {
+				logger.Warnf("Set storage tier: %s", err)
 			}
 		}
+	}
+	src, err = wrapSyncEncryptedStore(src, c.String("decrypt-rsa-key"), "JFS_DECRYPT_RSA_PASSPHRASE", "decrypt", c.String("decrypt-algo"))
+	if err != nil {
+		return err
+	}
+	dst, err = wrapSyncEncryptedStore(dst, c.String("encrypt-rsa-key"), "JFS_ENCRYPT_RSA_PASSPHRASE", "encrypt", c.String("encrypt-algo"))
+	if err != nil {
+		return err
 	}
 
 	if config.Manager == "" && !config.Dry {

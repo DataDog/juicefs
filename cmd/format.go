@@ -142,6 +142,10 @@ func formatStorageFlags() []cli.Flag {
 			Name:  "storage-class",
 			Usage: "the default storage class",
 		},
+		&cli.StringFlag{
+			Name:  "tag",
+			Usage: "custom tag when uploading object storage (e.g. --tag key=value)",
+		},
 	})
 }
 
@@ -204,6 +208,10 @@ func formatManagementFlags() []cli.Flag {
 			Name:  "ranger-service",
 			Usage: "Name of the Ranger service used For JuiceFS",
 		},
+		&cli.StringFlag{
+			Name:  "kerberos-config-file",
+			Usage: "Path to Kerberos configuration file",
+		},
 	})
 }
 
@@ -226,7 +234,6 @@ func fixObjectSize(s uint64) uint64 {
 }
 
 func createStorage(format meta.Format) (object.ObjectStorage, error) {
-
 	if err := format.Decrypt(); err != nil {
 		return nil, fmt.Errorf("format decrypt: %s", err)
 	}
@@ -278,14 +285,9 @@ func createStorage(format meta.Format) (object.ObjectStorage, error) {
 		return nil, err
 	}
 	blob = object.WithPrefix(blob, format.Name+"/")
-	if format.StorageClass != "" {
-		if os, ok := blob.(object.SupportStorageClass); ok {
-			err := os.SetStorageClass(format.StorageClass)
-			if err != nil {
-				logger.Warnf("set storage class %q: %v", format.StorageClass, err)
-			}
-		} else {
-			logger.Warnf("Storage class is not supported by %q, will ignore", format.Storage)
+	if os, ok := blob.(object.SupportTier); ok {
+		if err := os.InitTiers(format.Tiers); err != nil {
+			logger.Warnf("Set storage tier: %s", err)
 		}
 	}
 	if format.EncryptKey != "" {
@@ -316,10 +318,9 @@ func randSeq(n int) string {
 	return string(b)
 }
 
-func doTesting(store object.ObjectStorage, key string, data []byte) error {
-	ctx := context.Background()
+func doTesting(ctx context.Context, store object.ObjectStorage, key string, data []byte) error {
 	if err := store.Put(ctx, key, bytes.NewReader(data)); err != nil {
-		if strings.Contains(err.Error(), "Access Denied") {
+		if strings.Contains(strings.ToLower(err.Error()), "denied") {
 			return fmt.Errorf("Failed to put: %s", err)
 		}
 		if err2 := store.Create(ctx); err2 != nil {
@@ -334,6 +335,10 @@ func doTesting(store object.ObjectStorage, key string, data []byte) error {
 		if err := store.Put(ctx, key, bytes.NewReader(data)); err != nil {
 			return fmt.Errorf("Failed to put: %s", err)
 		}
+	}
+	// GLACIER storage class doesn't allow read after write
+	if _, ok := ctx.Value(object.TierKey{}).(uint8); ok {
+		return nil
 	}
 	p, err := store.Get(ctx, key, 0, -1)
 	if err != nil {
@@ -355,14 +360,14 @@ func doTesting(store object.ObjectStorage, key string, data []byte) error {
 	return nil
 }
 
-func test(store object.ObjectStorage) error {
+func test(ctx context.Context, store object.ObjectStorage) error {
 	key := "testing/" + randSeq(10)
 	data := make([]byte, 100)
 	utils.RandRead(data)
 	nRetry := 3
 	var err error
 	for i := 0; i < nRetry; i++ {
-		err = doTesting(store, key, data)
+		err = doTesting(ctx, store, key, data)
 		if err == nil {
 			break
 		}
@@ -381,9 +386,20 @@ func loadEncrypt(keyPath string) string {
 	}
 	pem, err := os.ReadFile(keyPath)
 	if err != nil {
-		logger.Fatalf("load RSA key from %s: %s", keyPath, err)
+		logger.Fatalf("load RSA key from %q: %s", keyPath, err)
 	}
 	return string(pem)
+}
+
+func readKerbConf(file string) string {
+	if file == "" {
+		return ""
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		logger.Fatalf("load Kerberos config from %q: %s", file, err)
+	}
+	return string(data)
 }
 
 func format(c *cli.Context) error {
@@ -393,10 +409,10 @@ func format(c *cli.Context) error {
 	name := c.Args().Get(1)
 	validName := regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$`)
 	if !validName.MatchString(name) {
-		logger.Fatalf("invalid name: %s, only alphabet, number and - are allowed, and the length should be 3 to 63 characters.", name)
+		logger.Fatalf("invalid name: %q, only alphabet, number and - are allowed, and the length should be 3 to 63 characters.", name)
 	}
 	if v := c.String("compress"); compress.NewCompressor(v) == nil {
-		logger.Fatalf("Unsupported compress algorithm: %s", v)
+		logger.Fatalf("Unsupported compress algorithm: %q", v)
 	}
 	if v := c.Int("trash-days"); v < 0 {
 		logger.Fatalf("Invalid trash days: %d", v)
@@ -447,11 +463,13 @@ func format(c *cli.Context) error {
 			case "storage":
 				format.Storage = c.String(flag)
 			case "encrypt-rsa-key", "encrypt-algo":
-				logger.Warnf("Flag %s is ignored since it cannot be updated", flag)
+				logger.Warnf("Flag %q is ignored since it cannot be updated", flag)
 			case "ranger-rest-url":
 				format.RangerRestUrl = c.String(flag)
 			case "ranger-service":
 				format.RangerService = c.String(flag)
+			case "kerberos-config-file":
+				format.KerbConf = readKerbConf(c.String(flag))
 			}
 		}
 	} else if strings.HasPrefix(err.Error(), "database is not formatted") {
@@ -461,6 +479,7 @@ func format(c *cli.Context) error {
 			UUID:             uuid.New().String(),
 			Storage:          c.String("storage"),
 			StorageClass:     c.String("storage-class"),
+			Tiers:            object.NewTiers(""),
 			Bucket:           c.String("bucket"),
 			AccessKey:        c.String("access-key"),
 			SecretKey:        c.String("secret-key"),
@@ -481,12 +500,23 @@ func format(c *cli.Context) error {
 			EnableACL:        c.Bool("enable-acl"),
 			RangerRestUrl:    c.String("ranger-rest-url"),
 			RangerService:    c.String("ranger-service"),
+			KerbConf:         readKerbConf(c.String("kerberos-config-file")),
 		}
+		if sc := c.String("storage-class"); sc != "" {
+			format.Tiers[0] = object.Tier{
+				ID: 0,
+				Sc: sc,
+			}
+		}
+
 		if format.EnableACL {
 			format.MinClientVersion = "1.2.0-A"
 		}
 		if format.RangerRestUrl != "" || format.RangerService != "" {
 			format.MinClientVersion = "1.3.0-A"
+		}
+		if format.KerbConf != "" {
+			format.MinClientVersion = "1.4.0-A"
 		}
 
 		if format.AccessKey == "" && os.Getenv("ACCESS_KEY") != "" {
@@ -509,7 +539,7 @@ func format(c *cli.Context) error {
 		if err == nil {
 			format.Bucket = p
 		} else {
-			logger.Fatalf("Failed to get absolute path of %s: %s", format.Bucket, err)
+			logger.Fatalf("Failed to get absolute path of %q: %s", format.Bucket, err)
 		}
 		if format.Storage == "file" {
 			format.Bucket += "/"
@@ -522,7 +552,7 @@ func format(c *cli.Context) error {
 	}
 	logger.Infof("Data use %s", blob)
 	if os.Getenv("JFS_NO_CHECK_OBJECT_STORAGE") == "" {
-		if err := test(blob); err != nil {
+		if err := test(context.Background(), blob); err != nil {
 			logger.Fatalf("Storage %s is not configured correctly: %s", blob, err)
 		}
 		if create {

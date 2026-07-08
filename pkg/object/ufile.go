@@ -247,11 +247,11 @@ func (u *ufile) List(ctx context.Context, prefix, start, token, delimiter string
 	objs := make([]Object, len(out.Contents))
 	for i, item := range out.Contents {
 		size_, _ := strconv.ParseInt(item.Size, 10, 64)
-		objs[i] = &obj{item.Key, size_, time.Unix(int64(item.LastModified), 0), strings.HasSuffix(item.Key, "/"), ""}
+		objs[i] = &obj{item.Key, size_, time.Unix(int64(item.LastModified), 0), strings.HasSuffix(item.Key, "/"), "", ""}
 	}
 	if delimiter != "" {
 		for _, item := range out.CommonPrefixes {
-			objs = append(objs, &obj{item.Prefix, 0, time.Unix(0, 0), true, ""})
+			objs = append(objs, &obj{item.Prefix, 0, time.Unix(0, 0), true, "", ""})
 		}
 		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
 	}
@@ -279,7 +279,7 @@ func (u *ufile) CreateMultipartUpload(ctx context.Context, key string) (*Multipa
 	if err := u.parseResp(resp, &out); err != nil {
 		return nil, err
 	}
-	return &MultipartUpload{UploadID: out.UploadId, MinPartSize: out.BlkSize, MaxCount: 1000000}, nil
+	return &MultipartUpload{UploadID: out.UploadId, MinPartSize: int64(out.BlkSize), MaxCount: 1000000}, nil
 }
 
 func (u *ufile) UploadPart(ctx context.Context, key string, uploadID string, num int, data []byte) (*Part, error) {

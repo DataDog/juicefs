@@ -95,8 +95,9 @@ jobs:
       - name: Download example database
         timeout-minutes: 5
         uses: dawidd6/action-download-artifact@v9
+        if: false
         with:
-          name: fsrand-hypothesis-example-db-${{ matrix.meta }}
+          name: command2-hypothesis-example-db-${{ matrix.meta }}
           path: .hypothesis/examples
           if_no_artifact_found: ignore
           workflow_conclusion: ""
@@ -124,7 +125,7 @@ jobs:
 
       - name: Upload example database
         uses: actions/upload-artifact@v4
-        if: always()
+        if: false
         with:
           include-hidden-files: true
           name: command2-hypothesis-example-db-${{ matrix.meta }}
@@ -159,8 +160,9 @@ jobs:
         if: failure() && github.event_name != 'workflow_dispatch'
         uses: juicedata/slack-notify-action@main
         with:
-          channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_PR_CHECK_NOTIFY }}"
+          channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_JUICEFS_CE_CI_NOTIFY }}"
           slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"
+          workflow_name: ${{ github.workflow }}
 
       - name: Success
         if: success()

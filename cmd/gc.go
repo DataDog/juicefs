@@ -137,7 +137,7 @@ func gc(ctx *cli.Context) error {
 	edge := time.Now().Add(-time.Duration(format.TrashDays) * 24 * time.Hour)
 	if delete {
 		cleanTrashSpin := progress.AddCountSpinner("Cleaned trash")
-		m.CleanupTrashBefore(c, edge, cleanTrashSpin.IncrBy)
+		_ = m.CleanupTrashBefore(c, edge, cleanTrashSpin.IncrBy, nil)
 		cleanTrashSpin.Done()
 
 		cleanDetachedNodeSpin := progress.AddCountSpinner("Cleaned detached nodes")
@@ -168,7 +168,7 @@ func gc(ctx *cli.Context) error {
 		spin := progress.AddDoubleSpinnerTwo("Compacted slices", "Compacted data")
 		m.OnMsg(meta.CompactChunk, func(args ...interface{}) error {
 			slices := args[0].([]meta.Slice)
-			err := vfs.Compact(chunkConf, store, slices, args[1].(uint64))
+			err := vfs.Compact(chunkConf, store, slices, args[1].(uint64), args[2].(uint8))
 			for _, s := range slices {
 				spin.IncrInt64(int64(s.Len))
 			}
@@ -294,7 +294,17 @@ func gc(ctx *cli.Context) error {
 		if obj.IsDir() {
 			continue
 		}
-		if obj.Mtime().After(maxMtime) || obj.Mtime().Unix() == 0 {
+		if obj.Size() == 0 || obj.Mtime().Unix() == 0 {
+			headObj, err := blob.Head(ctx.Context, obj.Key())
+			if err != nil {
+				logger.Warnf("head %s: %s", obj.Key(), err)
+				bar.Increment()
+				skipped.IncrInt64(obj.Size())
+				continue
+			}
+			obj = headObj
+		}
+		if obj.Mtime().After(maxMtime) {
 			logger.Debugf("ignore new block: %s %s", obj.Key(), obj.Mtime())
 			bar.Increment()
 			skipped.IncrInt64(obj.Size())

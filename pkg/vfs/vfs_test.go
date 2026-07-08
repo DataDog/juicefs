@@ -69,12 +69,13 @@ func createTestVFS(applyMetaConfOption func(metaConfig *meta.Config), metaUri st
 		Format:  *format,
 		Version: "Juicefs",
 		Chunk: &chunk.Config{
-			BlockSize:  format.BlockSize * 1024,
-			Compress:   format.Compression,
-			MaxUpload:  2,
-			BufferSize: 30 << 20,
-			CacheSize:  10 << 20,
-			CacheDir:   "memory",
+			BlockSize:   format.BlockSize * 1024,
+			Compress:    format.Compression,
+			MaxUpload:   2,
+			MaxDownload: 200,
+			BufferSize:  30 << 20,
+			CacheSize:   10 << 20,
+			CacheDir:    "memory",
 		},
 		FuseOpts: &FuseOptions{},
 	}
@@ -873,10 +874,54 @@ func TestInternalFile(t *testing.T) {
 	}
 }
 
+func TestHideInternal(t *testing.T) {
+	// Without HideInternal: internal files should appear in readdir
+	v1, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.Background())
+	fh, _ := v1.Opendir(ctx, 1, 0)
+	entries, _, e := v1.Readdir(ctx, 1, 1024, 0, fh, true)
+	if e != 0 {
+		t.Fatalf("readdir without hide-internal: %s", e)
+	}
+	var countVisible int
+	for _, entry := range entries {
+		if IsSpecialName(string(entry.Name)) && entry.Attr.Typ == meta.TypeFile {
+			countVisible++
+		}
+	}
+	if countVisible == 0 {
+		t.Fatalf("internal files should be visible when HideInternal is false")
+	}
+	v1.Releasedir(ctx, 1, fh)
+
+	// With HideInternal: internal files should not appear in readdir
+	v2, _ := createTestVFS(nil, "")
+	v2.Conf.HideInternal = true
+	fh2, _ := v2.Opendir(ctx, 1, 0)
+	entries2, _, e2 := v2.Readdir(ctx, 1, 1024, 0, fh2, true)
+	if e2 != 0 {
+		t.Fatalf("readdir with hide-internal: %s", e2)
+	}
+	for _, entry := range entries2 {
+		if IsSpecialName(string(entry.Name)) && entry.Attr.Typ == meta.TypeFile {
+			t.Fatalf("internal file %q should be hidden when HideInternal is true", string(entry.Name))
+		}
+	}
+	v2.Releasedir(ctx, 1, fh2)
+
+	// Even with HideInternal, Lookup should still work for internal files
+	if _, e := v2.Lookup(ctx, 1, ".stats"); e != 0 {
+		t.Fatalf("should still be able to lookup .stats with HideInternal: %s", e)
+	}
+	if _, e := v2.Lookup(ctx, 1, ".config"); e != 0 {
+		t.Fatalf("should still be able to lookup .config with HideInternal: %s", e)
+	}
+}
+
 func TestReaddirCache(t *testing.T) {
 	engines := map[string]string{
-		"kv":    "",
-		"db":    "sqlite3://",
+		"kv":    "memkv://",
+		"db":    "sqlite3://:memory:",
 		"redis": "redis://127.0.0.1:6379/2",
 	}
 	for typ, metaUri := range engines {
@@ -1093,8 +1138,8 @@ func testReaddirBatch(t *testing.T, metaUri string, typ string, batchNum int) {
 
 func TestReadDirBatch(t *testing.T) {
 	engines := map[string]string{
-		"kv":    "",
-		"db":    "sqlite3://",
+		"kv":    "memkv://",
+		"db":    "sqlite3://:memory:",
 		"redis": "redis://127.0.0.1:6379/2",
 	}
 	for typ, metaUri := range engines {
@@ -1105,8 +1150,8 @@ func TestReadDirBatch(t *testing.T) {
 
 func TestReaddir(t *testing.T) {
 	engines := map[string]string{
-		"kv":    "",
-		"db":    "sqlite3://",
+		"kv":    "memkv://",
+		"db":    "sqlite3://:memory:",
 		"redis": "redis://127.0.0.1:6379/2",
 	}
 	for typ, metaUri := range engines {

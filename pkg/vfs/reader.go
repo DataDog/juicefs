@@ -175,7 +175,7 @@ func (s *sliceReader) run() {
 	err := f.r.m.Read(meta.Background(), inode, indx, &slices)
 	f.Lock()
 	length := f.length
-	if s.state != BUSY || f.err != 0 || f.closing {
+	if s.state != BUSY || f.shouldStop() {
 		s.done(0, 0)
 	}
 	if err == syscall.ENOENT {
@@ -236,7 +236,7 @@ func (s *sliceReader) invalidate() {
 	case NEW:
 	case BUSY:
 		s.state = REFRESH
-		// TODO: interrupt reader
+		// TODO cancel ongoing read
 	case READY:
 		if s.refs > 0 {
 			s.state = NEW
@@ -252,7 +252,7 @@ func (s *sliceReader) drop() {
 	if s.state <= BREAK {
 		if s.refs == 0 {
 			s.state = BREAK
-			// TODO: interrupt reader
+			s.cancel()
 		}
 	} else {
 		if s.refs == 0 {
@@ -261,7 +261,6 @@ func (s *sliceReader) drop() {
 			s.state = INVALID // somebody still using it, so mark it for removal
 		}
 	}
-	s.cancel()
 }
 
 func (s *sliceReader) delete() {
@@ -636,7 +635,7 @@ func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, sys
 	f.acquire()
 	defer f.release()
 
-	if f.err != 0 || f.closing {
+	if f.shouldStop() {
 		return 0, f.err
 	}
 

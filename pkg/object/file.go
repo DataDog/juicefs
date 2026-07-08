@@ -22,13 +22,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"math/rand"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -105,6 +103,7 @@ func toFile(key string, fi fs.FileInfo, isSymlink bool, ownerGetter func(fs.File
 			fi.ModTime(),
 			fi.IsDir(),
 			"",
+			"",
 		},
 		owner,
 		group,
@@ -131,7 +130,7 @@ func (d *filestore) Get(ctx context.Context, key string, off, limit int64, gette
 		_ = f.Close()
 		return nil, err
 	}
-	if finfo.IsDir() || off > finfo.Size() {
+	if finfo.IsDir() || off >= finfo.Size() {
 		_ = f.Close()
 		return io.NopCloser(bytes.NewBuffer([]byte{})), nil
 	}
@@ -160,10 +159,12 @@ func (d *filestore) Put(ctx context.Context, key string, in io.Reader, getters .
 		if len(name) > 200 {
 			name = name[:200]
 		}
-		tmp = filepath.Join(filepath.Dir(p), "."+name+".tmp"+strconv.Itoa(rand.Int()))
+		tmp = TmpFilePath(p, name)
 		defer func() {
 			if err != nil {
-				_ = os.Remove(tmp)
+				if e := os.Remove(tmp); e != nil && !os.IsNotExist(e) {
+					logger.Warnf("delete %s: %s", tmp, e)
+				}
 			}
 		}()
 	}
@@ -254,24 +255,31 @@ func readDirSorted(dir string, followLink bool) ([]*mEntry, error) {
 		return nil, err
 	}
 
-	mEntries := make([]*mEntry, len(entries))
-	for i, e := range entries {
+	mEntries := make([]*mEntry, 0, len(entries))
+	for _, e := range entries {
 		isSymlink := e.Mode()&os.ModeSymlink != 0
 		if e.IsDir() {
-			mEntries[i] = &mEntry{e, e.Name() + dirSuffix, nil, false}
+			mEntries = append(mEntries, &mEntry{e, e.Name() + dirSuffix, nil, false})
 		} else if isSymlink && followLink {
 			fi, err := os.Stat(filepath.Join(dir, e.Name()))
 			if err != nil {
-				mEntries[i] = &mEntry{e, e.Name(), nil, true}
+				mEntries = append(mEntries, &mEntry{e, e.Name(), nil, true})
 				continue
 			}
 			name := e.Name()
 			if fi.IsDir() {
 				name = e.Name() + dirSuffix
+			} else if !fi.Mode().IsRegular() {
+				logger.Warnf("%s is not a regular file, ignore it", name)
+				continue
 			}
-			mEntries[i] = &mEntry{e, name, fi, false}
+			mEntries = append(mEntries, &mEntry{e, name, fi, false})
 		} else {
-			mEntries[i] = &mEntry{e, e.Name(), nil, isSymlink}
+			if !isSymlink && !e.Mode().IsRegular() {
+				logger.Warnf("%s is not a regular file, ignore it", e.Name())
+				continue
+			}
+			mEntries = append(mEntries, &mEntry{e, e.Name(), nil, isSymlink})
 		}
 	}
 	sort.Slice(mEntries, func(i, j int) bool { return mEntries[i].Name() < mEntries[j].Name() })
@@ -306,7 +314,7 @@ func (d *filestore) List(ctx context.Context, prefix, marker, token, delimiter s
 			return nil, false, "", nil
 		}
 		if os.IsNotExist(err) {
-			logger.Warnf("skip %s: %s", dir, err)
+			logger.Debugf("skip %s: %s", dir, err)
 			return nil, false, "", nil
 		}
 		return nil, false, "", err

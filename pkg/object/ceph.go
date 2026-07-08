@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ceph/go-ceph/rados"
 )
@@ -203,7 +204,7 @@ func (c *ceph) Head(_ context.Context, key string) (Object, error) {
 		if err != nil {
 			return err
 		}
-		o = &obj{key, int64(stat.Size), stat.ModTime, strings.HasSuffix(key, "/"), ""}
+		o = &obj{key, int64(stat.Size), stat.ModTime, strings.HasSuffix(key, "/"), "", ""}
 		return nil
 	})
 	if err == rados.ErrNotFound {
@@ -222,7 +223,23 @@ func (c *ceph) ListAll(_ context.Context, prefix, marker string, followLink bool
 		ctx.Destroy()
 		return nil, err
 	}
-	defer iter.Close()
+
+	var objs = make(chan Object, 1000)
+	if v := os.Getenv("JFS_OBJECT_NO_ORDER"); v == "1" || v == "true" {
+		go func() {
+			defer close(objs)
+			for iter.Next() {
+				key := iter.Value()
+				if key == "" || key <= marker || !strings.HasPrefix(key, prefix) {
+					continue
+				}
+				objs <- &obj{key, 0, time.Time{}, key[len(key)-1] == '/', "", ""}
+			}
+			iter.Close()
+			c.release(ctx)
+		}()
+		return objs, nil
+	}
 
 	// FIXME: this will be really slow for many objects
 	keys := make([]string, 0, 1000)
@@ -233,11 +250,11 @@ func (c *ceph) ListAll(_ context.Context, prefix, marker string, followLink bool
 		}
 		keys = append(keys, key)
 	}
+	iter.Close()
+	c.release(ctx)
 	// the keys are not ordered, sort them first
 	sort.Strings(keys)
-	c.release(ctx)
 
-	var objs = make(chan Object, 1000)
 	var concurrent = 20
 	ms := make([]sync.Mutex, concurrent)
 	conds := make([]*sync.Cond, concurrent)
@@ -267,7 +284,7 @@ func (c *ceph) ListAll(_ context.Context, prefix, marker string, followLink bool
 							errs[j] = err
 						}
 					} else {
-						results[j] = &obj{key, int64(st.Size), st.ModTime, strings.HasSuffix(key, "/"), ""}
+						results[j] = &obj{key, int64(st.Size), st.ModTime, strings.HasSuffix(key, "/"), "", ""}
 					}
 
 					ms[j].Lock()
@@ -339,13 +356,11 @@ func newCeph(endpoint, cluster, user, token string) (ObjectStorage, error) {
 			logger.Warnf("Failed to set log_file to %s: %s", opt, err)
 		}
 	}
-	if os.Getenv("JFS_NO_CHECK_OBJECT_STORAGE") == "" {
-		if err := conn.ReadDefaultConfigFile(); err != nil {
-			return nil, fmt.Errorf("Can't read default config file: %s", err)
-		}
-		if err := conn.Connect(); err != nil {
-			return nil, fmt.Errorf("Can't connect to cluster %s: %s", cluster, err)
-		}
+	if err := conn.ReadDefaultConfigFile(); err != nil {
+		return nil, fmt.Errorf("Can't read default config file: %s", err)
+	}
+	if err := conn.Connect(); err != nil {
+		return nil, fmt.Errorf("Can't connect to cluster %s: %s", cluster, err)
 	}
 	return &ceph{
 		name: name,

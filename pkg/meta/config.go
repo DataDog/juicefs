@@ -75,34 +75,41 @@ func (c *Config) SelfCheck() {
 }
 
 type Format struct {
-	Name             string
-	UUID             string
-	Storage          string
-	StorageClass     string `json:",omitempty"`
-	Bucket           string
-	AccessKey        string `json:",omitempty"`
-	SecretKey        string `json:",omitempty"`
-	SessionToken     string `json:",omitempty"`
-	BlockSize        int
-	Compression      string `json:",omitempty"`
-	Shards           int    `json:",omitempty"`
-	HashPrefix       bool   `json:",omitempty"`
-	Capacity         uint64 `json:",omitempty"`
-	Inodes           uint64 `json:",omitempty"`
-	EncryptKey       string `json:",omitempty"`
-	EncryptAlgo      string `json:",omitempty"`
-	KeyEncrypted     bool   `json:",omitempty"`
-	UploadLimit      int64  `json:",omitempty"` // Mbps
-	DownloadLimit    int64  `json:",omitempty"` // Mbps
-	TrashDays        int
-	MetaVersion      int    `json:",omitempty"`
-	MinClientVersion string `json:",omitempty"`
-	MaxClientVersion string `json:",omitempty"`
-	DirStats         bool   `json:",omitempty"`
-	UserGroupQuota   bool   `json:",omitempty"`
-	EnableACL        bool
-	RangerRestUrl    string `json:",omitempty"`
-	RangerService    string `json:",omitempty"`
+	Name              string
+	UUID              string
+	Storage           string
+	StorageClass      string `json:",omitempty"`
+	Tiers             object.Tiers
+	Bucket            string
+	AccessKey         string `json:",omitempty"`
+	SecretKey         string `json:",omitempty"`
+	SessionToken      string `json:",omitempty"`
+	BlockSize         int
+	Compression       string `json:",omitempty"`
+	Shards            int    `json:",omitempty"`
+	HashPrefix        bool   `json:",omitempty"`
+	Capacity          uint64 `json:",omitempty"`
+	Inodes            uint64 `json:",omitempty"`
+	EncryptKey        string `json:",omitempty"`
+	EncryptAlgo       string `json:",omitempty"`
+	KeyEncrypted      bool   `json:",omitempty"`
+	UploadLimit       int64  `json:",omitempty"` // Mbps
+	DownloadLimit     int64  `json:",omitempty"` // Mbps
+	TrashDays         int
+	MetaVersion       int    `json:",omitempty"`
+	MinClientVersion  string `json:",omitempty"`
+	MaxClientVersion  string `json:",omitempty"`
+	DirStats          bool   `json:",omitempty"`
+	UserGroupQuota    bool   `json:",omitempty"`
+	EnableACL         bool
+	RangerRestUrl     string `json:",omitempty"`
+	RangerService     string `json:",omitempty"`
+	ChangeLog         bool   `json:",omitempty"`
+	ChangeLogMaxAge   int64  `json:",omitempty"`
+	ChangeLogMaxLines int64  `json:",omitempty"`
+
+	//kerberos
+	KerbConf string `json:",omitempty"`
 }
 
 func (f *Format) update(old *Format, force bool) error {
@@ -125,7 +132,15 @@ func (f *Format) update(old *Format, force bool) error {
 			args = []interface{}{"meta version", old.MetaVersion, f.MetaVersion}
 		}
 		if args == nil {
-			f.UUID = old.UUID
+			if f.UUID != old.UUID {
+				if err := f.Decrypt(); err != nil {
+					return fmt.Errorf("decrypt format: %s", err)
+				}
+				f.UUID = old.UUID // UUID cannot be changed alone
+				if err := f.Encrypt(); err != nil {
+					return fmt.Errorf("encrypt format: %s", err)
+				}
+			}
 		} else {
 			return fmt.Errorf("cannot update volume %s from %v to %v", args...)
 		}

@@ -17,6 +17,8 @@ package sync
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
 	"fmt"
 	"io"
 	"math"
@@ -90,10 +92,8 @@ func deepEqualWithOutMtime(a, b object.Object) bool {
 
 // nolint:errcheck
 func TestSync(t *testing.T) {
-	defer func() {
-		_ = os.RemoveAll("/tmp/a")
-		_ = os.RemoveAll("/tmp/b")
-	}()
+	tmpA := t.TempDir() + "/"
+	tmpB := t.TempDir() + "/"
 	config := &Config{
 		Start:       "",
 		End:         "",
@@ -112,14 +112,14 @@ func TestSync(t *testing.T) {
 		Quiet:       true,
 	}
 	os.Args = []string{"--include", "a[1-9]", "--exclude", "a*", "--exclude", "c*"}
-	a, _ := object.CreateStorage("file", "/tmp/a/", "", "", "")
+	a, _ := object.CreateStorage("file", tmpA, "", "", "")
 	a.Put(ctx, "a1", bytes.NewReader([]byte("a1")))
 	a.Put(ctx, "a2", bytes.NewReader([]byte("a2")))
 	a.Put(ctx, "abc", bytes.NewReader([]byte("abc")))
 	a.Put(ctx, "c1", bytes.NewReader([]byte("c1")))
 	a.Put(ctx, "c2", bytes.NewReader([]byte("c2")))
 
-	b, _ := object.CreateStorage("file", "/tmp/b/", "", "", "")
+	b, _ := object.CreateStorage("file", tmpB, "", "", "")
 	b.Put(ctx, "a1", bytes.NewReader([]byte("a1")))
 	b.Put(ctx, "ba", bytes.NewReader([]byte("a1")))
 
@@ -179,10 +179,8 @@ func TestSync(t *testing.T) {
 
 // nolint:errcheck
 func TestSyncIncludeAndExclude(t *testing.T) {
-	defer func() {
-		_ = os.RemoveAll("/tmp/a")
-		_ = os.RemoveAll("/tmp/b")
-	}()
+	tmpA := t.TempDir() + "/"
+	tmpB := t.TempDir() + "/"
 	config := &Config{
 		Start:       "",
 		End:         "",
@@ -199,8 +197,8 @@ func TestSyncIncludeAndExclude(t *testing.T) {
 		MaxSize:     math.MaxInt64,
 		Exclude:     []string{"1"},
 	}
-	a, _ := object.CreateStorage("file", "/tmp/a/", "", "", "")
-	b, _ := object.CreateStorage("file", "/tmp/b/", "", "", "")
+	a, _ := object.CreateStorage("file", tmpA, "", "", "")
+	b, _ := object.CreateStorage("file", tmpB, "", "", "")
 
 	simple := []string{"a1/z1/z2", "a2", "ab1", "ab2", "b1", "b2", "c1", "c2"}
 	testCases := []struct {
@@ -244,8 +242,8 @@ func TestSyncIncludeAndExclude(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		_ = os.RemoveAll("/tmp/a/")
-		_ = os.RemoveAll("/tmp/b/")
+		_ = os.RemoveAll(tmpA)
+		_ = os.RemoveAll(tmpB)
 		os.Args = testCase.args
 		for _, k := range testCase.srcKey {
 			a.Put(ctx, k, bytes.NewReader([]byte(k)))
@@ -311,21 +309,19 @@ func TestParseRules(t *testing.T) {
 }
 
 func TestSyncLink(t *testing.T) {
-	defer func() {
-		_ = os.RemoveAll("/tmp/a")
-		_ = os.RemoveAll("/tmp/b")
-	}()
+	tmpA := t.TempDir() + "/"
+	tmpB := t.TempDir() + "/"
 
-	a, _ := object.CreateStorage("file", "/tmp/a/", "", "", "")
+	a, _ := object.CreateStorage("file", tmpA, "", "", "")
 	a.Put(ctx, "a1", bytes.NewReader([]byte("test")))
 	as := a.(object.SupportSymlink)
-	as.Symlink("/tmp/a/a1", "l1")
+	as.Symlink(tmpA+"a1", "l1")
 	as.Symlink("./../a1", "d1/l2")
 	as.Symlink("./../notExist", "l3")
 
-	b, _ := object.CreateStorage("file", "/tmp/b/", "", "", "")
+	b, _ := object.CreateStorage("file", tmpB, "", "", "")
 	bs := b.(object.SupportSymlink)
-	bs.Symlink("/tmp/b/a1", "l1")
+	bs.Symlink(tmpB+"a1", "l1")
 
 	if err := Sync(a, b, &Config{
 		Threads:     50,
@@ -342,7 +338,7 @@ func TestSyncLink(t *testing.T) {
 	}
 
 	l1, err := bs.Readlink("l1")
-	if err != nil || l1 != "/tmp/a/a1" {
+	if err != nil || l1 != tmpA+"a1" {
 		t.Fatalf("readlink: %s content: %s", err, l1)
 	}
 	content, err := b.Get(ctx, "l1", 0, -1)
@@ -371,19 +367,62 @@ func TestSyncLink(t *testing.T) {
 	}
 }
 
-func TestSyncLinkWithOutFollow(t *testing.T) {
-	defer func() {
-		_ = os.RemoveAll("/tmp/a")
-		_ = os.RemoveAll("/tmp/b")
-	}()
+func TestSyncFilesFromSymlinkDirWithLinks(t *testing.T) {
+	for _, entry := range []string{"dir-link"} { // TODO: "dir-link/" would failed
+		t.Run(entry, func(t *testing.T) {
+			srcDir := t.TempDir()
+			dstDir := t.TempDir()
+			filesFrom := srcDir + "/files-from"
+			if err := os.WriteFile(filesFrom, []byte(entry+"\ndir1\n"), 0644); err != nil {
+				t.Fatalf("write files-from: %s", err)
+			}
 
-	a, _ := object.CreateStorage("file", "/tmp/a/", "", "", "")
+			src, _ := object.CreateStorage("file", srcDir+"/", "", "", "")
+			if err := src.Put(ctx, "dir1/file1", bytes.NewReader([]byte("test"))); err != nil {
+				t.Fatalf("put file: %s", err)
+			}
+			if err := src.(object.SupportSymlink).Symlink("dir1", "dir-link"); err != nil {
+				t.Fatalf("symlink dir-link: %s", err)
+			}
+
+			dst, _ := object.CreateStorage("file", dstDir+"/", "", "", "")
+			if err := Sync(src, dst, &Config{
+				Threads:     2,
+				ListThreads: 1,
+				Links:       true,
+				Quiet:       true,
+				FilesFrom:   filesFrom,
+				Limit:       -1,
+				MaxSize:     math.MaxInt64,
+			}); err != nil {
+				t.Fatalf("sync: %s", err)
+			}
+
+			target, err := os.Readlink(dstDir + "/dir-link")
+			if err != nil {
+				t.Fatalf("readlink dir-link: %s", err)
+			}
+			if target != "dir1" {
+				t.Fatalf("dir-link target = %q, want %q", target, "dir1")
+			}
+			if _, err := dst.Head(ctx, "dir1/file1"); err != nil {
+				t.Fatalf("head dir1/file1: %s", err)
+			}
+		})
+	}
+}
+
+func TestSyncLinkWithOutFollow(t *testing.T) {
+	tmpA := t.TempDir() + "/"
+	tmpB := t.TempDir() + "/"
+
+	a, _ := object.CreateStorage("file", tmpA, "", "", "")
 	a.Put(ctx, "a1", bytes.NewReader([]byte("test")))
 	as := a.(object.SupportSymlink)
-	as.Symlink("/tmp/a/a1", "l1")
+	as.Symlink(tmpA+"a1", "l1")
 	as.Symlink("./../notExist", "l3")
 
-	b, _ := object.CreateStorage("file", "/tmp/b/", "", "", "")
+	b, _ := object.CreateStorage("file", tmpB, "", "", "")
 
 	if err := Sync(a, b, &Config{
 		Threads:     50,
@@ -405,22 +444,22 @@ func TestSyncLinkWithOutFollow(t *testing.T) {
 		t.Fatalf("read content error: %s", err)
 	}
 
-	if lstat, err := os.Lstat("/tmp/b/l1"); err != nil && lstat.Mode()&os.ModeSymlink != 0 {
+	if lstat, err := os.Lstat(tmpB + "l1"); err != nil && lstat.Mode()&os.ModeSymlink != 0 {
 		t.Fatalf("should follow link")
 	}
-	if _, err := os.Stat("/tmp/b/l3"); !os.IsNotExist(err) {
+	if _, err := os.Stat(tmpB + "l3"); !os.IsNotExist(err) {
 		t.Fatalf("should not copy broken link")
 	}
 }
 
 func TestSingleLink(t *testing.T) {
-	defer func() {
-		_ = os.RemoveAll("/tmp/a")
-		_ = os.RemoveAll("/tmp/b")
-	}()
-	_ = os.Symlink("/tmp/aa", "/tmp/a")
-	a, _ := object.CreateStorage("file", "/tmp/a", "", "", "")
-	b, _ := object.CreateStorage("file", "/tmp/b", "", "", "")
+	tmpDir := t.TempDir()
+	tmpA := tmpDir + "/a"
+	tmpB := tmpDir + "/b"
+	tmpTarget := tmpDir + "/aa"
+	_ = os.Symlink(tmpTarget, tmpA)
+	a, _ := object.CreateStorage("file", tmpA, "", "", "")
+	b, _ := object.CreateStorage("file", tmpB, "", "", "")
 	if err := Sync(a, b, &Config{
 		Threads:     50,
 		ListThreads: 1,
@@ -434,31 +473,29 @@ func TestSingleLink(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("sync: %s", err)
 	}
-	readlink, _ := os.Readlink("/tmp/a")
-	readlink2, err := os.Readlink("/tmp/b")
+	readlink, _ := os.Readlink(tmpA)
+	readlink2, err := os.Readlink(tmpB)
 	if err != nil {
 		t.Fatalf("sync err: %v", err)
 	}
 
-	if readlink != readlink2 || readlink != "/tmp/aa" {
+	if readlink != readlink2 || readlink != tmpTarget {
 		t.Fatalf("sync link failed")
 	}
 }
 
 func TestSyncCheckAllLink(t *testing.T) {
-	defer func() {
-		_ = os.RemoveAll("/tmp/a")
-		_ = os.RemoveAll("/tmp/b")
-	}()
+	tmpA := t.TempDir() + "/"
+	tmpB := t.TempDir() + "/"
 
-	a, _ := object.CreateStorage("file", "/tmp/a/", "", "", "")
+	a, _ := object.CreateStorage("file", tmpA, "", "", "")
 	a.Put(ctx, "a1", bytes.NewReader([]byte("test")))
 	as := a.(object.SupportSymlink)
-	as.Symlink("/tmp/a/a1", "l1")
+	as.Symlink(tmpA+"a1", "l1")
 
-	b, _ := object.CreateStorage("file", "/tmp/b/", "", "", "")
+	b, _ := object.CreateStorage("file", tmpB, "", "", "")
 	bs := b.(object.SupportSymlink)
-	bs.Symlink("/tmp/b/a1", "l1")
+	bs.Symlink(tmpB+"a1", "l1")
 
 	if err := Sync(a, b, &Config{
 		Threads:     50,
@@ -474,7 +511,7 @@ func TestSyncCheckAllLink(t *testing.T) {
 	}
 
 	l1, err := bs.Readlink("l1")
-	if err != nil || l1 != "/tmp/a/a1" {
+	if err != nil || l1 != tmpA+"a1" {
 		t.Fatalf("readlink: %s content: %s", err, l1)
 	}
 	content, err := b.Get(ctx, "l1", 0, -1)
@@ -487,17 +524,15 @@ func TestSyncCheckAllLink(t *testing.T) {
 }
 
 func TestSyncCheckNewLink(t *testing.T) {
-	defer func() {
-		_ = os.RemoveAll("/tmp/a")
-		_ = os.RemoveAll("/tmp/b")
-	}()
+	tmpA := t.TempDir() + "/"
+	tmpB := t.TempDir() + "/"
 
-	a, _ := object.CreateStorage("file", "/tmp/a/", "", "", "")
+	a, _ := object.CreateStorage("file", tmpA, "", "", "")
 	a.Put(ctx, "a1", bytes.NewReader([]byte("test")))
 	as := a.(object.SupportSymlink)
-	as.Symlink("/tmp/a/a1", "l1")
+	as.Symlink(tmpA+"a1", "l1")
 
-	b, _ := object.CreateStorage("file", "/tmp/b/", "", "", "")
+	b, _ := object.CreateStorage("file", tmpB, "", "", "")
 	bs := b.(object.SupportSymlink)
 
 	if err := Sync(a, b, &Config{
@@ -514,7 +549,7 @@ func TestSyncCheckNewLink(t *testing.T) {
 	}
 
 	l1, err := bs.Readlink("l1")
-	if err != nil || l1 != "/tmp/a/a1" {
+	if err != nil || l1 != tmpA+"a1" {
 		t.Fatalf("readlink: %s content: %s", err, l1)
 	}
 	content, err := b.Get(ctx, "l1", 0, -1)
@@ -527,14 +562,12 @@ func TestSyncCheckNewLink(t *testing.T) {
 }
 
 func TestLimits(t *testing.T) {
-	defer func() {
-		_ = os.RemoveAll("/tmp/a/")
-		_ = os.RemoveAll("/tmp/b/")
-		_ = os.RemoveAll("/tmp/c/")
-	}()
-	a, _ := object.CreateStorage("file", "/tmp/a/", "", "", "")
-	b, _ := object.CreateStorage("file", "/tmp/b/", "", "", "")
-	c, _ := object.CreateStorage("file", "/tmp/c/", "", "", "")
+	tmpA := t.TempDir() + "/"
+	tmpB := t.TempDir() + "/"
+	tmpC := t.TempDir() + "/"
+	a, _ := object.CreateStorage("file", tmpA, "", "", "")
+	b, _ := object.CreateStorage("file", tmpB, "", "", "")
+	c, _ := object.CreateStorage("file", tmpC, "", "", "")
 	put := func(storage object.ObjectStorage, keys []string) {
 		for _, key := range keys {
 			if key != "" {
@@ -584,6 +617,169 @@ func TestLimits(t *testing.T) {
 		if err != nil {
 			t.Fatalf("testKeysEqual fail: %s", err)
 		}
+	}
+}
+
+// Regression test for the shared --limit budget between source processing and
+// destination-extra deletion. The budget is consumed by both deletions and
+// synced source objects; a source object is only counted in total after it
+// passes the limit check, so the run must not report it as "lost".
+func TestSyncLimitDeleteDstBoundary(t *testing.T) {
+	tmpSrc := t.TempDir() + "/"
+	tmpDst := t.TempDir() + "/"
+	src, _ := object.CreateStorage("file", tmpSrc, "", "", "")
+	dst, _ := object.CreateStorage("file", tmpDst, "", "", "")
+
+	// Source has a single new file "a2" that does not exist on the destination.
+	if err := src.Put(ctx, "a2", bytes.NewReader([]byte{})); err != nil {
+		t.Fatalf("put src a2: %s", err)
+	}
+	// Destination has a single extra file "a1" (sorts before "a2") only on dst.
+	if err := dst.Put(ctx, "a1", bytes.NewReader([]byte{})); err != nil {
+		t.Fatalf("put dst a1: %s", err)
+	}
+
+	// With --limit 2 the budget is exactly enough to delete "a1" and copy "a2":
+	// deleting "a1" consumes one unit and syncing "a2" consumes the last one.
+	// The current source object "a2" must still be synced rather than dropped.
+	config := &Config{
+		Threads:     50,
+		Update:      true,
+		Perms:       true,
+		MaxSize:     math.MaxInt64,
+		ListThreads: 1,
+		DeleteDst:   true,
+		Limit:       2,
+	}
+	if err := Sync(src, dst, config); err != nil {
+		t.Fatalf("sync: %s", err)
+	}
+
+	all, err := ListAll(dst, "", "", "", true)
+	if err != nil {
+		t.Fatalf("list all dst: %s", err)
+	}
+	if err := testKeysEqual(all, []string{"", "a2"}); err != nil {
+		t.Fatalf("testKeysEqual fail: %s", err)
+	}
+}
+
+// Regression test: while deleting an extra dst object consumes part of the
+// --limit budget, the producer must still scan dstkeys to locate the current
+// source object's matching dst. Otherwise the object is treated as missing on
+// dst and gets copied/overwritten, breaking --ignore-existing (and similarly
+// --existing/--update).
+func TestSyncLimitDeleteDstIgnoreExisting(t *testing.T) {
+	tmpSrc := t.TempDir() + "/"
+	tmpDst := t.TempDir() + "/"
+	src, _ := object.CreateStorage("file", tmpSrc, "", "", "")
+	dst, _ := object.CreateStorage("file", tmpDst, "", "", "")
+
+	// Source has "a2" with new content.
+	if err := src.Put(ctx, "a2", bytes.NewReader([]byte("new"))); err != nil {
+		t.Fatalf("put src a2: %s", err)
+	}
+	// Destination has an extra "a1" (sorts before "a2") and an existing "a2"
+	// with different content that --ignore-existing must preserve.
+	if err := dst.Put(ctx, "a1", bytes.NewReader([]byte{})); err != nil {
+		t.Fatalf("put dst a1: %s", err)
+	}
+	if err := dst.Put(ctx, "a2", bytes.NewReader([]byte("old"))); err != nil {
+		t.Fatalf("put dst a2: %s", err)
+	}
+
+	// With --limit 2, deleting "a1" consumes one unit and locating/skipping the
+	// matching "a2" consumes the last one. The current source object "a2"
+	// already exists on dst, so --ignore-existing must skip it rather than
+	// overwrite it.
+	config := &Config{
+		Threads:        50,
+		Perms:          true,
+		MaxSize:        math.MaxInt64,
+		ListThreads:    1,
+		DeleteDst:      true,
+		IgnoreExisting: true,
+		Limit:          2,
+	}
+	if err := Sync(src, dst, config); err != nil {
+		t.Fatalf("sync: %s", err)
+	}
+
+	all, err := ListAll(dst, "", "", "", true)
+	if err != nil {
+		t.Fatalf("list all dst: %s", err)
+	}
+	if err := testKeysEqual(all, []string{"", "a2"}); err != nil {
+		t.Fatalf("testKeysEqual fail: %s", err)
+	}
+	c, err := dst.Get(ctx, "a2", 0, -1)
+	if err != nil {
+		t.Fatalf("get dst a2: %s", err)
+	}
+	data, _ := io.ReadAll(c)
+	if string(data) != "old" {
+		t.Fatalf("a2 should be preserved by --ignore-existing, got %q", string(data))
+	}
+}
+
+// Regression test for the "leftover dst" branch: a dst object retained from a
+// previous source iteration is deleted as extra for the current source object,
+// consuming part of the --limit budget. The producer must still scan dstkeys to
+// find the current object's matching dst instead of treating it as missing, so
+// that --ignore-existing is honored (the same applies to --existing/--update).
+func TestSyncLimitDeleteDstLeftoverIgnoreExisting(t *testing.T) {
+	tmpSrc := t.TempDir() + "/"
+	tmpDst := t.TempDir() + "/"
+	src, _ := object.CreateStorage("file", tmpSrc, "", "", "")
+	dst, _ := object.CreateStorage("file", tmpDst, "", "", "")
+
+	// Source: "a1" (new on dst) and "a4" (also present on dst).
+	if err := src.Put(ctx, "a1", bytes.NewReader([]byte("a1"))); err != nil {
+		t.Fatalf("put src a1: %s", err)
+	}
+	if err := src.Put(ctx, "a4", bytes.NewReader([]byte("new"))); err != nil {
+		t.Fatalf("put src a4: %s", err)
+	}
+	// Destination: extra "a2" (sorts between a1 and a4) and existing "a4".
+	if err := dst.Put(ctx, "a2", bytes.NewReader([]byte{})); err != nil {
+		t.Fatalf("put dst a2: %s", err)
+	}
+	if err := dst.Put(ctx, "a4", bytes.NewReader([]byte("old"))); err != nil {
+		t.Fatalf("put dst a4: %s", err)
+	}
+
+	// Processing "a1" reads and retains dst "a2" (a2 > a1). When processing
+	// "a4", the retained "a2" is deleted as extra, which consumes one unit of
+	// the shared budget (limit 3 = copy a1 + delete a2 + sync a4). The matching
+	// dst "a4" must still be located so --ignore-existing skips it instead of
+	// overwriting.
+	config := &Config{
+		Threads:        50,
+		Perms:          true,
+		MaxSize:        math.MaxInt64,
+		ListThreads:    1,
+		DeleteDst:      true,
+		IgnoreExisting: true,
+		Limit:          3,
+	}
+	if err := Sync(src, dst, config); err != nil {
+		t.Fatalf("sync: %s", err)
+	}
+
+	all, err := ListAll(dst, "", "", "", true)
+	if err != nil {
+		t.Fatalf("list all dst: %s", err)
+	}
+	if err := testKeysEqual(all, []string{"", "a1", "a4"}); err != nil {
+		t.Fatalf("testKeysEqual fail: %s", err)
+	}
+	c, err := dst.Get(ctx, "a4", 0, -1)
+	if err != nil {
+		t.Fatalf("get dst a4: %s", err)
+	}
+	data, _ := io.ReadAll(c)
+	if string(data) != "old" {
+		t.Fatalf("a4 should be preserved by --ignore-existing, got %q", string(data))
 	}
 }
 
@@ -767,6 +963,7 @@ func (o *mockObject) IsSymlink() bool      { return false }
 func (o *mockObject) Size() int64          { return o.size }
 func (o *mockObject) Mtime() time.Time     { return o.mtime }
 func (o *mockObject) StorageClass() string { return "" }
+func (o *mockObject) Status() string       { return "" }
 
 func TestFilterSizeAndAge(t *testing.T) {
 	config := &Config{
@@ -794,5 +991,173 @@ func TestFilterSizeAndAge(t *testing.T) {
 
 	if filterKey(&mockObject{200, now.Add(-time.Hour * 2)}, now, nil, config) {
 		t.Fatalf("filterKey should fail")
+	}
+}
+
+// nolint:errcheck
+func TestSyncEncrypt(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate RSA key: %s", err)
+	}
+	kc := object.NewRSAEncryptor(rsaKey)
+	enc, err := object.NewDataEncryptor(kc, object.AES256GCM_RSA)
+	if err != nil {
+		t.Fatalf("create encryptor: %s", err)
+	}
+
+	// sync plaintext src -> encrypted dst
+	src, _ := object.CreateStorage("mem", "", "", "", "")
+	dst, _ := object.CreateStorage("mem", "", "", "", "")
+
+	testData := map[string]string{
+		"file1.txt":     "hello world",
+		"dir/file2.txt": "foo bar baz",
+		"empty.txt":     "x",
+	}
+	for k, v := range testData {
+		src.Put(ctx, k, bytes.NewReader([]byte(v)))
+	}
+
+	encDst := object.NewChunkedEncrypted(dst, enc)
+	if err := Sync(src, encDst, &Config{
+		Threads:     10,
+		ListThreads: 1,
+		Update:      true,
+		Limit:       -1,
+		MaxSize:     math.MaxInt64,
+		Quiet:       true,
+	}); err != nil {
+		t.Fatalf("sync to encrypted dst: %s", err)
+	}
+
+	// Verify dst has encrypted data (raw read should differ from plaintext)
+	for k, v := range testData {
+		r, err := dst.Get(ctx, k, 0, -1)
+		if err != nil {
+			t.Fatalf("get raw %s: %s", k, err)
+		}
+		raw, _ := io.ReadAll(r)
+		if string(raw) == v {
+			t.Fatalf("data for %s should be encrypted but got plaintext", k)
+		}
+	}
+
+	// sync encrypted src -> plaintext dst (decrypt)
+	dst2, _ := object.CreateStorage("mem", "", "", "", "")
+	encSrc := object.NewChunkedEncrypted(dst, enc)
+	if err := Sync(encSrc, dst2, &Config{
+		Threads:     10,
+		ListThreads: 1,
+		Update:      true,
+		Limit:       -1,
+		MaxSize:     math.MaxInt64,
+		Quiet:       true,
+	}); err != nil {
+		t.Fatalf("sync from encrypted src: %s", err)
+	}
+
+	// Verify dst2 has original plaintext
+	for k, v := range testData {
+		r, err := dst2.Get(ctx, k, 0, -1)
+		if err != nil {
+			t.Fatalf("get decrypted %s: %s", k, err)
+		}
+		data, _ := io.ReadAll(r)
+		if string(data) != v {
+			t.Fatalf("decrypted %s: got %q, want %q", k, string(data), v)
+		}
+	}
+
+	// decrypt with wrong key should fail
+	rsaKey2, _ := rsa.GenerateKey(rand.Reader, 2048)
+	kc2 := object.NewRSAEncryptor(rsaKey2)
+	enc2, _ := object.NewDataEncryptor(kc2, object.AES256GCM_RSA)
+	wrongSrc := object.NewChunkedEncrypted(dst, enc2)
+	dst3, _ := object.CreateStorage("mem", "", "", "", "")
+	err = Sync(wrongSrc, dst3, &Config{
+		Threads:     10,
+		ListThreads: 1,
+		Update:      true,
+		Limit:       -1,
+		MaxSize:     math.MaxInt64,
+		Quiet:       true,
+	})
+	// Sync should complete but with failures (wrong key can't decrypt)
+	ch, _ := ListAll(dst3, "", "", "", true)
+	var count int
+	for range ch {
+		count++
+	}
+	if count == len(testData) {
+		t.Fatalf("decrypting with wrong key should not produce all files")
+	}
+}
+
+// nolint:errcheck
+func TestSyncEncryptLargeFile(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate RSA key: %s", err)
+	}
+	kc := object.NewRSAEncryptor(rsaKey)
+	enc, err := object.NewDataEncryptor(kc, object.AES256GCM_RSA)
+	if err != nil {
+		t.Fatalf("create encryptor: %s", err)
+	}
+
+	src, _ := object.CreateStorage("mem", "", "", "", "")
+	dst, _ := object.CreateStorage("mem", "", "", "", "")
+
+	// Create a large file that spans multiple chunks (>8 MiB)
+	largeData := make([]byte, 9<<20) // 9 MiB
+	for i := range largeData {
+		largeData[i] = byte(i % 253)
+	}
+	src.Put(ctx, "large.bin", bytes.NewReader(largeData))
+
+	encDst := object.NewChunkedEncrypted(dst, enc)
+	if err := Sync(src, encDst, &Config{
+		Threads:     10,
+		ListThreads: 1,
+		Update:      true,
+		Limit:       -1,
+		MaxSize:     math.MaxInt64,
+		Quiet:       true,
+	}); err != nil {
+		t.Fatalf("sync large file to encrypted dst: %s", err)
+	}
+
+	// Verify encrypted data differs from plaintext
+	r, err := dst.Get(ctx, "large.bin", 0, -1)
+	if err != nil {
+		t.Fatalf("get raw large.bin: %s", err)
+	}
+	raw, _ := io.ReadAll(r)
+	if bytes.Equal(raw, largeData) {
+		t.Fatalf("large file should be encrypted")
+	}
+
+	// Decrypt back
+	dst2, _ := object.CreateStorage("mem", "", "", "", "")
+	encSrc := object.NewChunkedEncrypted(dst, enc)
+	if err := Sync(encSrc, dst2, &Config{
+		Threads:     10,
+		ListThreads: 1,
+		Update:      true,
+		Limit:       -1,
+		MaxSize:     math.MaxInt64,
+		Quiet:       true,
+	}); err != nil {
+		t.Fatalf("sync large file from encrypted src: %s", err)
+	}
+
+	r, err = dst2.Get(ctx, "large.bin", 0, -1)
+	if err != nil {
+		t.Fatalf("get decrypted large.bin: %s", err)
+	}
+	got, _ := io.ReadAll(r)
+	if !bytes.Equal(got, largeData) {
+		t.Fatalf("decrypted large file mismatch: got %d bytes, want %d", len(got), len(largeData))
 	}
 }

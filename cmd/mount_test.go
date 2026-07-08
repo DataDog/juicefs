@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -45,11 +46,16 @@ import (
 )
 
 const testMeta = "redis://127.0.0.1:6379/11"
-const testMountPoint = "/tmp/jfs-unit-test"
+
+var testMountPoint = filepath.Join(os.TempDir(), fmt.Sprintf("jfs-unit-test-%d", os.Getpid()))
+
 const testVolume = "test"
 
 // gomonkey may encounter the problem of insufficient permissions under mac, please solve it by viewing this link https://github.com/agiledragon/gomonkey/issues/70
 func Test_exposeMetrics(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("gomonkey cannot patch functions on darwin/arm64")
+	}
 	addr := "redis://127.0.0.1:6379/12"
 	client := meta.NewClient(addr, nil)
 	format := &meta.Format{
@@ -94,6 +100,20 @@ func Test_exposeMetrics(t *testing.T) {
 	require.Nil(t, err)
 	require.NotEmpty(t, all)
 	require.Contains(t, string(all), `key1="value1"`)
+
+	pprofURL := url.URL{Scheme: "http", Host: metricsAddr, Path: "/debug/pprof/cmdline"}
+	pprofResp, err := http.Get(pprofURL.String())
+	require.Nil(t, err)
+	pprofBody, err := io.ReadAll(pprofResp.Body)
+	require.Nil(t, err)
+	_ = pprofResp.Body.Close()
+	require.Equal(t, http.StatusNotFound, pprofResp.StatusCode)
+	require.NotContains(t, string(pprofBody), os.Args[0])
+
+	require.NotPanics(t, func() {
+		registerer2, registry2 := wrapRegister(appCtx, "test", "test2")
+		_ = exposeMetrics(appCtx, registerer2, registry2)
+	})
 }
 
 func ResetHttp() {
@@ -211,11 +231,10 @@ func TestUpdateFstab(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.SkipNow()
 	}
-	mockFstab, err := os.CreateTemp("/tmp", "fstab")
+	mockFstab, err := os.CreateTemp(t.TempDir(), "fstab")
 	if err != nil {
 		t.Fatalf("cannot make temp file: %s", err)
 	}
-	defer os.Remove(mockFstab.Name())
 
 	patches := gomonkey.ApplyFunc(os.Rename, func(src, dest string) error {
 		content, err := os.ReadFile(mockFstab.Name())

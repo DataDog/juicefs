@@ -160,7 +160,7 @@ If you wish to use a storage system that is not listed, feel free to submit a re
 | [DigitalOcean Spaces](#digitalocean-spaces)                 | `space`    |
 | [Wasabi](#wasabi)                                           | `wasabi`   |
 | [Telnyx Cloud Storage](#telnyx)                             | `s3`       |
-| [Storj DCS](#storj-dcs)                                     | `s3`       |
+| [Storj](#storj)                                             | `storj`    |
 | [Vultr Object Storage](#vultr-object-storage)               | `s3`       |
 | [Cloudflare R2](#r2)                                        | `s3`       |
 | [Bunny Storage](#bunny)                                     | `bunny`    |
@@ -192,6 +192,7 @@ If you wish to use a storage system that is not listed, feel free to submit a re
 | [PostgreSQL](#postgresql)                                   | `postgres` |
 | [Local disk](#local-disk)                                   | `file`     |
 | [SFTP/SSH](#sftp)                                           | `sftp`     |
+| [CIFS/SMB](#cifs)                                           | `cifs`     |
 
 ### Amazon S3
 
@@ -268,6 +269,19 @@ juicefs format \
 The format of the option `--bucket` for all S3 compatible object storage services is `https://<bucket>.<endpoint>` or `https://<endpoint>/<bucket>`. The default `region` is `us-east-1`. When a different `region` is required, it can be set manually via the environment variable `AWS_REGION` or `AWS_DEFAULT_REGION`.
 :::
 
+:::tip
+For AWS SDK request and response checksums, JuiceFS sets `AWS_REQUEST_CHECKSUM_CALCULATION` and `AWS_RESPONSE_CHECKSUM_VALIDATION` to `when_required` by default. As a result, SDK-level checksum headers are only sent or validated when required by S3. This improves compatibility with S3-compatible services.
+
+If you are using Amazon S3 and want the SDK to calculate and validate checksums whenever checksum support is available for an operation, set the following environment variables before running JuiceFS:
+
+```shell
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_supported
+export AWS_RESPONSE_CHECKSUM_VALIDATION=when_supported
+```
+
+These settings only affect AWS SDK-level checksums. The `disable-checksum=true` query parameter in `--bucket` controls the CRC checksum that JuiceFS stores in object metadata.
+:::
+
 ### Google Cloud Storage {#google-cloud}
 
 Google Cloud uses [IAM](https://cloud.google.com/iam/docs/overview) to manage permissions for accessing resources. Through authorizing [service accounts](https://cloud.google.com/iam/docs/creating-managing-service-accounts#iam-service-accounts-create-gcloud), you can have a fine-grained control of the access rights of cloud servers and object storage.
@@ -327,6 +341,27 @@ juicefs format \
 :::note
 For Azure users in China, the value of `EndpointSuffix` is `core.chinacloudapi.cn`.
 :::
+
+#### Managed Identity Authentication <VersionAdd>1.4</VersionAdd> {#azure-managed-identity}
+
+Starting from v1.4, JuiceFS supports Azure [Managed Identity](https://learn.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/overview) authentication. When `--access-key` and `--secret-key` are not provided, JuiceFS will automatically use the [DefaultAzureCredential](https://learn.microsoft.com/en-us/azure/developer/go/azure-sdk-authentication) chain, which tries the following credential sources in order:
+
+1. Environment variables (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`)
+2. Workload Identity (for Kubernetes)
+3. Managed Identity (system-assigned or user-assigned)
+4. Azure CLI credentials
+
+For example, to use managed identity on an Azure VM:
+
+```bash
+juicefs format \
+    --storage wasb \
+    --bucket https://<container>.<endpoint> \
+    ... \
+    myjfs
+```
+
+No `--access-key` or `--secret-key` is needed when using managed identity.
 
 ### Backblaze B2
 
@@ -461,24 +496,23 @@ juicefs format \
 
 Available regional endpoints are [here](https://developers.telnyx.com/docs/cloud-storage/api-endpoints).
 
-### Storj DCS
+### Storj
 
-Please refer to [this document](https://docs.storj.io/api-reference/s3-compatible-gateway) to learn how to create access key and secret key.
+Storj provides a native Uplink integration. Use `storj` as the `--storage` option and generate a [Storj Access Grant](https://storj.dev/learn/concepts/access/access-grants).
 
-Storj DCS is an S3-compatible storage, using `s3` for option `--storage`. The setting format of the option `--bucket` is `https://gateway.<region>.storjshare.io/<bucket>`, and please replace `<region>` with the corresponding region code you need. There are currently three available regions: `us1`, `ap1` and `eu1`. For example:
+Pass the access grant via `--access-key` and the bucket name via `--bucket`:
 
 ```shell
 juicefs format \
-    --storage s3 \
-    --bucket https://gateway.<region>.storjshare.io/<bucket> \
-    --access-key <your-access-key> \
-    --secret-key <your-sceret-key> \
+    --storage storj \
+    --bucket <bucket-name> \
+    --access-key <your-access-grant> \
     ... \
     myjfs
 ```
 
-:::caution
-Storj DCS [ListObjects](https://github.com/storj/gateway-st/blob/main/docs/s3-compatibility.md#listobjects) API is not fully S3 compatible (result list is not sorted), so some features of JuiceFS do not work. For example, `juicefs gc`, `juicefs fsck`, `juicefs sync`, `juicefs destroy`. And when using `juicefs mount`, you need to disable [automatic-backup](../administration/metadata_dump_load.md#backup-automatically) function by adding `--backup-meta 0`.
+:::note
+Because encryption happens before upload and the keys never leave your client, Storj already provides the same protection that JuiceFS' own encryption would offer. Because of this, adding [JuiceFS encryption at rest](https://juicefs.com/docs/community/security/encryption/#enable-data-encryption-at-rest) using `--encrypt-rsa-key` on top would result in double-encrypting every block: first by JuiceFS (RSA key-wrap + AES) and then again by the uplink library (AES-GCM). The result is the same security, but with measurably higher CPU usage on every read and write. For more information, check [Storj encryption documentation](https://storj.dev/learn/concepts/access/encryption-and-keys).
 :::
 
 ### Vultr Object Storage
@@ -821,6 +855,10 @@ In order to reach Ceph Monitor, `librados` reads Ceph configuration file by sear
 - `ceph.conf` in the current working directory
 
 Since these additional Ceph configuration files are needed during the mount, CSI Driver users need to [upload them to Kubernetes, and map to the mount pod](https://juicefs.com/docs/csi/guide/pv/#mount-pod-extra-files).
+
+:::caution
+For workloads that only need to scan object keys, setting `JFS_OBJECT_NO_ORDER=1` or `JFS_OBJECT_NO_ORDER=true` skips sorting and per-object stat calls during Ceph RADOS listing. This improves listing speed for large pools, but the returned objects are unordered and do not include reliable size or modification time. Do not enable it for commands that rely on ordered listing or object metadata, such as `sync`.
+:::
 
 To format a volume, run:
 
@@ -1247,6 +1285,37 @@ juicefs format  \
 - `--bucket` is used to set the server address and storage path in the format `[sftp://]<IP/Domain>:[port]:<Path>`. Note that the directory name should end with `/`, and the port number is optionally defaulted to `22`, e.g. `192.168.1.11:22:myjfs/`.
 - `--access-key` set the username of the remote server
 - `--secret-key` set the password of the remote server
+
+### CIFS/SMB {#cifs}
+
+CIFS (Common Internet File System) and SMB (Server Message Block) are network file-sharing protocols widely used in Windows environments. They allow computers on a network to access shared files and folders on remote servers.
+
+JuiceFS supports using CIFS or SMB as the underlying data storage. This is useful when you have existing Windows file servers or NAS devices that support the SMB protocol.
+
+```bash
+juicefs format \
+    --storage cifs \
+    --bucket 192.168.1.100/share \
+    --access-key username \
+    --secret-key password \
+    ...
+    redis://localhost:6379/1 myjfs
+```
+
+:::note Notes
+
+- `--storage` can be set to either `cifs` or `smb`. Both are supported.
+- The `--bucket` format is `<host>[:port]/<share>` or `cifs://<host>[:port]/<share>`, where `<share>` is the SMB share name. The default port is `445`.
+- `--access-key` specifies the username for SMB authentication.
+- `--secret-key` specifies the password for SMB authentication.
+:::
+
+:::caution Limitations
+
+- The SMB protocol has limited support for Unix file permissions. Only read-only (0444) and writable (0666) modes are supported. Other permission bits are ignored.
+- Symbolic links are not fully supported as they are in POSIX systems.
+- To adjust the connection pool size, set the `JFS_CIFS_MAX_POOL` environment variable (`8` by default).
+:::
 
 ### NFS {#nfs}
 

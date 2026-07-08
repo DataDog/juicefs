@@ -38,8 +38,9 @@ const subSampleFile = "metadata-sub.sample"
 
 func TestEscape(t *testing.T) {
 	cases := []struct {
-		value            []rune
-		gbkStart, gbkEnd int
+		value                []rune
+		gbkStart, gbkEnd     int
+		expectedEscapedValue string
 	}{
 		{value: []rune("%1F果汁数据科技有限公司%2B"), gbkStart: 0, gbkEnd: 0},
 		{value: []rune("果汁数据科技有限公司%1F"), gbkStart: 0, gbkEnd: 1},
@@ -51,6 +52,7 @@ func TestEscape(t *testing.T) {
 		{value: []rune("%果汁数据科%技有限公司%"), gbkStart: 1, gbkEnd: 4},
 		{value: []rune("\"果汁数据科\"技有限公司%"), gbkStart: 1, gbkEnd: 4},
 		{value: []rune("\\果汁数\\据科技有限公司"), gbkStart: 1, gbkEnd: 4},
+		{value: []rune("file name with spaces"), expectedEscapedValue: "file%20name%20with%20spaces"},
 	}
 	for _, c := range cases {
 		var v []byte
@@ -66,6 +68,9 @@ func TestEscape(t *testing.T) {
 		v = append(v, []byte(string(suffix))...)
 		s := escape(string(v))
 		t.Log("escape value: ", s)
+		if c.expectedEscapedValue != "" && s != c.expectedEscapedValue {
+			t.Fatalf("expected escaped value %q, but got %q", c.expectedEscapedValue, s)
+		}
 		r := unescape(s)
 		if !bytes.Equal(r, v) {
 			t.Fatalf("expected %v, but got %v", v, r)
@@ -178,6 +183,38 @@ func checkMeta(t *testing.T, m Meta) {
 	}
 	if *quota != expectedQuota {
 		t.Fatalf("expected: %v, but got: %v", expectedQuota, *quota)
+	}
+
+	userQuota, err := m.(engine).doGetQuota(ctx, UserQuotaType, 501)
+	if err != nil {
+		t.Fatalf("get user quota: %s", err)
+	}
+	if userQuota == nil {
+		t.Fatalf("get user quota: nil")
+	}
+	expectedUserQuota := Quota{
+		MaxSpace:  1099511627776,
+		MaxInodes: 1000000,
+	}
+	if userQuota.MaxSpace != expectedUserQuota.MaxSpace || userQuota.MaxInodes != expectedUserQuota.MaxInodes {
+		t.Fatalf("user quota: expected maxSpace=%d, maxInodes=%d, but got maxSpace=%d, maxInodes=%d",
+			expectedUserQuota.MaxSpace, expectedUserQuota.MaxInodes, userQuota.MaxSpace, userQuota.MaxInodes)
+	}
+
+	groupQuota, err := m.(engine).doGetQuota(ctx, GroupQuotaType, 20)
+	if err != nil {
+		t.Fatalf("get group quota: %s", err)
+	}
+	if groupQuota == nil {
+		t.Fatalf("get group quota: nil")
+	}
+	expectedGroupQuota := Quota{
+		MaxSpace:  2199023255552,
+		MaxInodes: 2000000,
+	}
+	if groupQuota.MaxSpace != expectedGroupQuota.MaxSpace || groupQuota.MaxInodes != expectedGroupQuota.MaxInodes {
+		t.Fatalf("group quota: expected maxSpace=%d, maxInodes=%d, but got maxSpace=%d, maxInodes=%d",
+			expectedGroupQuota.MaxSpace, expectedGroupQuota.MaxInodes, groupQuota.MaxSpace, groupQuota.MaxInodes)
 	}
 
 	attr := &Attr{}
@@ -338,8 +375,8 @@ func testLoadDump(t *testing.T, name, addr string) {
 
 func TestLoadDump(t *testing.T) { //skip mutate
 	testLoadDump(t, "redis", "redis://127.0.0.1/10")
-	// testLoadDump(t, "mysql", "mysql://root:@/dev")
-	testLoadDump(t, "badger", "badger://jfs-load-dump")
+	testLoadDump(t, "sqlite3", "sqlite3://"+path.Join(t.TempDir(), "jfs-load-dump-sqlite3.db"))
+	testLoadDump(t, "badger", "badger://"+path.Join(t.TempDir(), "jfs-load-dump"))
 	testLoadDump(t, "tikv", "tikv://127.0.0.1:2379/jfs-load-dump")
 }
 
@@ -411,7 +448,7 @@ func TestLoadDumpV2(t *testing.T) {
 	logger.SetLevel(logrus.DebugLevel)
 
 	engines := map[string][]string{
-		"sqlite3": {"sqlite3://dev.db", "sqlite3://dev2.db"},
+		"sqlite3": {"sqlite3://" + path.Join(t.TempDir(), "dev.db"), "sqlite3://" + path.Join(t.TempDir(), "dev2.db")},
 		// "mysql": {"mysql://root:@/dev", "mysql://root:@/dev2"},
 		"redis":  {"redis://127.0.0.1:6379/2", "redis://127.0.0.1:6379/3"},
 		"badger": {"badger://" + path.Join(t.TempDir(), "jfs-load-duimp-testdb-bk1"), "badger://" + path.Join(t.TempDir(), "jfs-load-duimp-testdb-bk2")},
@@ -486,8 +523,8 @@ func testSecretAndTrash(t *testing.T, addr, addr2 string) {
 		29: 10485760,
 	}
 	cnt := 0
-	m2.getBase().scanTrashFiles(Background(), func(inode Ino, size uint64, ts time.Time) (clean bool, err error) {
-		cnt++
+	m2.getBase().scanTrashFiles(Background(), func(inode Ino, size uint64, ts time.Time, count int64) (clean bool, err error) {
+		cnt += int(count)
 		if tSize, ok := trashs[inode]; !ok || size != tSize {
 			t.Fatalf("trash file: %d %d", inode, size)
 		}

@@ -73,12 +73,13 @@ func mount(url, mp string) {
 	}
 
 	chunkConf := chunk.Config{
-		BlockSize:  format.BlockSize * 1024,
-		Compress:   format.Compression,
-		MaxUpload:  20,
-		BufferSize: 300 << 20,
-		CacheSize:  1024,
-		CacheDir:   "memory",
+		BlockSize:   format.BlockSize * 1024,
+		Compress:    format.Compression,
+		MaxUpload:   20,
+		MaxDownload: 200,
+		BufferSize:  300 << 20,
+		CacheSize:   1024,
+		CacheDir:    "memory",
 	}
 
 	blob, err := object.CreateStorage(strings.ToLower(format.Storage), format.Bucket, format.AccessKey, format.SecretKey, format.SessionToken)
@@ -91,7 +92,7 @@ func mount(url, mp string) {
 	m.OnMsg(meta.CompactChunk, meta.MsgCallback(func(args ...interface{}) error {
 		slices := args[0].([]meta.Slice)
 		sliceId := args[1].(uint64)
-		return vfs.Compact(chunkConf, store, slices, sliceId)
+		return vfs.Compact(chunkConf, store, slices, sliceId, 0)
 	}))
 
 	conf := &vfs.Config{

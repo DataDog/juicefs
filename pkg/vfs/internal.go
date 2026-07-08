@@ -18,10 +18,10 @@ package vfs
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 	io_prometheus_client "github.com/prometheus/client_model/go"
@@ -52,7 +53,7 @@ func (v *VFS) getControlHandle(pid uint32) uint64 {
 	defer controlMutex.Unlock()
 	fh := controlHandlers[pid]
 	if fh == 0 {
-		h := v.newHandle(controlInode, false)
+		h := v.newHandle(controlInode, false, 0)
 		fh = h.fh
 		controlHandlers[pid] = fh
 	}
@@ -84,8 +85,8 @@ var internalNodes = []*internalNode{
 }
 
 func init() {
-	uid := uint32(os.Getuid())
-	gid := uint32(os.Getgid())
+	uid := uint32(utils.GetCurrentUID())
+	gid := uint32(utils.GetCurrentGID())
 	now := time.Now().Unix()
 	for _, v := range internalNodes {
 		if v.inode == trashInode {
@@ -211,54 +212,56 @@ func writeProgress(item1, item2 *uint64, out io.Writer, done chan struct{}) {
 	}
 }
 
-type obj struct {
-	key            string
-	size, off, len uint32
+type Obj struct {
+	Key            string
+	Size, Off, Len uint32
 }
 
-func (v *VFS) calcObjects(id uint64, size, offset, length uint32) []*obj {
+func CalcObjects(format meta.Format, id uint64, size, offset, length uint32) []*Obj {
 	if id == 0 {
-		return []*obj{{"", size, offset, length}}
+		return []*Obj{{"", size, offset, length}}
 	}
 	if length == 0 || offset+length > size {
 		logger.Warnf("Corrupt slice id %d size %d offset %d length %d", id, size, offset, length)
 		return nil
 	}
-	bsize := uint32(v.Conf.Chunk.BlockSize)
+	bsize := uint32(format.BlockSize * 1024)
 	var prefix string
-	if v.Conf.Chunk.HashPrefix {
-		prefix = fmt.Sprintf("%s/chunks/%02X/%v/%v", v.Conf.Format.Name, id%256, id/1000/1000, id)
+	if format.HashPrefix {
+		prefix = fmt.Sprintf("%s/chunks/%02X/%v/%v", format.Name, id%256, id/1000/1000, id)
 	} else {
-		prefix = fmt.Sprintf("%s/chunks/%v/%v/%v", v.Conf.Format.Name, id/1000/1000, id/1000, id)
+		prefix = fmt.Sprintf("%s/chunks/%v/%v/%v", format.Name, id/1000/1000, id/1000, id)
 	}
 	first := offset / bsize
 	last := (offset + length - 1) / bsize
-	objs := make([]*obj, 0, last-first+1)
+	objs := make([]*Obj, 0, last-first+1)
 	for indx := first; indx <= last; indx++ {
-		objs = append(objs, &obj{fmt.Sprintf("%s_%d_%d", prefix, indx, bsize), bsize, 0, bsize})
+		objs = append(objs, &Obj{fmt.Sprintf("%s_%d_%d", prefix, indx, bsize), bsize, 0, bsize})
 	}
 	fo, lo := objs[0], objs[len(objs)-1]
-	fo.off = offset - first*bsize
-	fo.len = fo.size - fo.off
+	fo.Off = offset - first*bsize
+	fo.Len = fo.Size - fo.Off
 	if (last+1)*bsize > size {
-		lo.size = size - last*bsize
-		lo.key = fmt.Sprintf("%s_%d_%d", prefix, last, lo.size)
+		lo.Size = size - last*bsize
+		lo.Key = fmt.Sprintf("%s_%d_%d", prefix, last, lo.Size)
 	}
-	lo.len = (offset + length) - last*bsize - lo.off
+	lo.Len = (offset + length) - last*bsize - lo.Off
 
 	return objs
 }
 
 type InfoResponse struct {
-	Ino     Ino
-	Failed  bool
-	Reason  string
-	Summary meta.Summary
-	Paths   []string
-	Chunks  []*chunkSlice
-	Objects []*chunkObj
-	PLocks  []meta.PLockItem
-	FLocks  []meta.FLockItem
+	Ino           Ino
+	Failed        bool
+	Reason        string
+	Summary       meta.Summary
+	Paths         []string
+	Chunks        []*chunkSlice
+	Objects       []*chunkObj
+	PLocks        []meta.PLockItem
+	FLocks        []meta.FLockItem
+	Tier          object.Tier
+	RestoreStatus string
 }
 
 type SummaryReponse struct {
@@ -335,12 +338,16 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		dstName := string(r.Get(int(r.Get8())))
 		umask := r.Get16()
 		cmode := r.Get8()
+		var concurrency uint8 = meta.CLONE_DEFAULT_CONCURRENCY // default for backward compatibility
+		if r.HasMore() {
+			concurrency = r.Get8()
+		}
 		var count, total uint64
 		var eno syscall.Errno
 		go func() {
-			logger.Infof("Start to clone %d/%d to %d/%s, cmode=%d, umask=%d", srcParentIno, srcIno, dstParentIno, dstName, cmode, umask)
-			if eno = v.Meta.Clone(ctx, srcParentIno, srcIno, dstParentIno, dstName, cmode, umask, &count, &total); eno != 0 {
-				logger.Errorf("clone failed srcIno:%d,dstParentIno:%d,dstName:%s,cmode:%d,umask:%d,eno:%v", srcIno, dstParentIno, dstName, cmode, umask, eno)
+			logger.Infof("Start to clone %d/%d to %d/%s, cmode=%d, umask=%d, concurrency=%d", srcParentIno, srcIno, dstParentIno, dstName, cmode, umask, concurrency)
+			if eno = v.Meta.Clone(ctx, srcParentIno, srcIno, dstParentIno, dstName, cmode, umask, concurrency, &count, &total); eno != 0 {
+				logger.Errorf("clone failed srcIno:%d,dstParentIno:%d,dstName:%s,cmode:%d,umask:%d,concurrency:%d,eno:%v", srcIno, dstParentIno, dstName, cmode, umask, concurrency, eno)
 			}
 			close(done)
 		}()
@@ -400,8 +407,8 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 					if raw {
 						fmt.Fprintf(w, "\t%d:\t%d\t%d\t%d\t%d\n", indx, c.Id, c.Size, c.Off, c.Len)
 					} else {
-						for _, o := range v.calcObjects(c.Id, c.Size, c.Off, c.Len) {
-							fmt.Fprintf(w, "\t%d:\t%s\t%d\t%d\t%d\n", indx, o.key, o.size, o.off, o.len)
+						for _, o := range CalcObjects(v.Conf.Format, c.Id, c.Size, c.Off, c.Len) {
+							fmt.Fprintf(w, "\t%d:\t%s\t%d\t%d\t%d\n", indx, o.Key, o.Size, o.Off, o.Len)
 						}
 					}
 				}
@@ -440,6 +447,24 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 			info.Failed = true
 			info.Reason = r.Error()
 		} else {
+			var attr meta.Attr
+			eno := v.Meta.GetAttr(ctx, inode, &attr)
+			info.Tier = object.Tier{}
+			if eno != 0 {
+				logger.Warnf("GetAttr of %d: %s", inode, eno)
+				info.Tier.ID = 0
+				info.Tier.Sc = "unknown"
+			} else {
+				if t, ok := v.Meta.GetFormat().Tiers[attr.Tier]; ok {
+					info.Tier.ID = t.ID
+					info.Tier.Sc = t.Sc
+					info.Tier.Tag = t.Tag
+				} else {
+					logger.Warnf("unknown tier id %d of inode %d", attr.Tier, inode)
+					info.Tier.Sc = "unknown"
+					info.Tier.ID = attr.Tier
+				}
+			}
 			info.Paths = v.Meta.GetPaths(ctx, inode)
 			if info.Summary.Files == 1 && info.Summary.Dirs == 0 {
 				for indx := uint64(0); indx*meta.ChunkSize < info.Summary.Length; indx++ {
@@ -449,10 +474,33 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 						if raw {
 							info.Chunks = append(info.Chunks, &chunkSlice{indx, c})
 						} else {
-							for _, o := range v.calcObjects(c.Id, c.Size, c.Off, c.Len) {
-								info.Objects = append(info.Objects, &chunkObj{indx, o.key, o.size, o.off, o.len})
+							for _, o := range CalcObjects(v.Conf.Format, c.Id, c.Size, c.Off, c.Len) {
+								info.Objects = append(info.Objects, &chunkObj{indx, o.Key, o.Size, o.Off, o.Len})
 							}
 						}
+					}
+				}
+			}
+			if len(info.Objects) > 0 {
+				var lastObjKey string
+				for i := len(info.Objects) - 1; i >= 0; i-- {
+					if info.Objects[i].Key != "" {
+						lastObjKey = strings.TrimPrefix(info.Objects[i].Key, v.Conf.Format.Name+"/")
+						break
+					}
+				}
+				if lastObjKey != "" {
+					if objInfo, err := v.Store.BlobStorage().Head(context.Background(), lastObjKey); err == nil {
+						info.RestoreStatus = objInfo.Status()
+						if info.Tier.ID != 0 && objInfo.StorageClass() != info.Tier.Sc ||
+							(info.Tier.ID == 0 && info.Tier.Sc != "" && objInfo.StorageClass() != info.Tier.Sc) {
+							info.Tier.Sc = fmt.Sprintf("expected(%s),actual(%s)", info.Tier.Sc, objInfo.StorageClass())
+						}
+						if info.Tier.ID == 0 && info.Tier.Sc == "" {
+							info.Tier.Sc = fmt.Sprintf("actual(%s)", objInfo.StorageClass())
+						}
+					} else {
+						logger.Warnf("Failed to get object info by Head for key %q (get restore status): %v", lastObjKey, err)
 					}
 				}
 			}

@@ -18,7 +18,6 @@ package meta
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -48,6 +47,7 @@ func (m *kvMeta) dump(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) err
 		m.dumpACL,
 		m.dumpQuota,
 		m.dumpDirStat,
+		m.dumpChangeLog,
 	}
 	ts := m.client.config("startTS")
 	if ts == nil && m.Name() == "tikv" {
@@ -98,7 +98,13 @@ func printSums(sums map[int]*atomic.Uint64) string {
 
 func (m *kvMeta) dumpCounters(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) error {
 	return m.txn(ctx, func(tx *kvTxn) error {
-		counters := make([]*pb.Counter, 0, len(counterNames))
+		counters := make([]*pb.Counter, 0, len(counterNames)+1)
+		if m.getFormat().ChangeLog {
+			maxKey := m.findLastLogKey(tx)
+			if maxKey > 0 {
+				counters = append(counters, &pb.Counter{Key: "lastChangelog", Value: int64(maxKey)})
+			}
+		}
 		for _, name := range counterNames {
 			val := tx.get(m.counterKey(name))
 			counters = append(counters, &pb.Counter{Key: name, Value: parseCounter(val)})
@@ -297,7 +303,7 @@ func (m *kvMeta) dumpMix(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) 
 		}
 		logger.Debugf("range: %v-%v", start, end)
 		eg.Go(func() error {
-			return m.txn(egCtx, func(tx *kvTxn) error {
+			return m.txn(WrapContext(egCtx), func(tx *kvTxn) error {
 				var ent *entry
 				tx.scan(start, end, false, func(k, v []byte) bool {
 					if egCtx.Err() != nil {
@@ -408,19 +414,51 @@ func (m *kvMeta) dumpACL(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) 
 
 func (m *kvMeta) dumpQuota(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) error {
 	return m.txn(ctx, func(tx *kvTxn) error {
-		quotas := make([]*pb.Quota, 0, 128)
+		var dirQuotas, userQuotas, groupQuotas []*pb.Quota
+
 		tx.scan(m.fmtKey("QD"), nextKey(m.fmtKey("QD")), false, func(k, v []byte) bool {
 			q := &pb.Quota{}
-			q.Inode = uint64(m.decodeInode([]byte(k)[2:]))
+			q.Type = uint32(DirQuotaType)
+			q.Key = uint64(m.decodeInode([]byte(k)[2:]))
 			b := utils.FromBuffer(v)
 			q.MaxSpace = int64(b.Get64())
 			q.MaxInodes = int64(b.Get64())
 			q.UsedSpace = int64(b.Get64())
 			q.UsedInodes = int64(b.Get64())
-			quotas = append(quotas, q)
+			dirQuotas = append(dirQuotas, q)
 			return true
 		})
-		return dumpResult(ctx, ch, &dumpedResult{msg: &pb.Batch{Quotas: quotas}})
+
+		tx.scan(m.fmtKey("QU"), nextKey(m.fmtKey("QU")), false, func(k, v []byte) bool {
+			q := &pb.Quota{}
+			q.Type = uint32(UserQuotaType)
+			q.Key = binary.BigEndian.Uint64([]byte(k)[2:])
+			b := utils.FromBuffer(v)
+			q.MaxSpace = int64(b.Get64())
+			q.MaxInodes = int64(b.Get64())
+			q.UsedSpace = int64(b.Get64())
+			q.UsedInodes = int64(b.Get64())
+			userQuotas = append(userQuotas, q)
+			return true
+		})
+
+		tx.scan(m.fmtKey("QG"), nextKey(m.fmtKey("QG")), false, func(k, v []byte) bool {
+			q := &pb.Quota{}
+			q.Type = uint32(GroupQuotaType)
+			q.Key = binary.BigEndian.Uint64([]byte(k)[2:])
+			b := utils.FromBuffer(v)
+			q.MaxSpace = int64(b.Get64())
+			q.MaxInodes = int64(b.Get64())
+			q.UsedSpace = int64(b.Get64())
+			q.UsedInodes = int64(b.Get64())
+			groupQuotas = append(groupQuotas, q)
+			return true
+		})
+		return dumpResult(ctx, ch, &dumpedResult{msg: &pb.Batch{
+			Quotas:      dirQuotas,
+			UserQuotas:  userQuotas,
+			GroupQuotas: groupQuotas,
+		}})
 	})
 }
 
@@ -441,7 +479,29 @@ func (m *kvMeta) dumpDirStat(ctx Context, opt *DumpOption, ch chan<- *dumpedResu
 	})
 }
 
-func (m *kvMeta) insertKVs(ctx context.Context, pairs []*pair, threads int) error {
+func (m *kvMeta) dumpChangeLog(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) error {
+	if !m.getFormat().ChangeLog {
+		return nil
+	}
+	return m.txn(ctx, func(tx *kvTxn) error {
+		maxKey := m.findLastLogKey(tx)
+		if maxKey == 0 {
+			return nil
+		}
+		beginID := m.client.rewind(maxKey, 1)
+		changelogs := make([]*pb.ChangeLog, 0, kvDumpBatchSize)
+		m.scanLogRange(tx, beginID, maxKey+1, false, func(id uint64, k, v []byte) bool {
+			changelogs = append(changelogs, &pb.ChangeLog{
+				Version: int64(id),
+				Entry:   v,
+			})
+			return true
+		})
+		return dumpResult(ctx, ch, &dumpedResult{msg: &pb.Batch{Changelogs: changelogs}})
+	})
+}
+
+func (m *kvMeta) insertKVs(ctx Context, pairs []*pair, threads int) error {
 	if len(pairs) == 0 {
 		return nil
 	}
@@ -464,7 +524,7 @@ func (m *kvMeta) insertKVs(ctx context.Context, pairs []*pair, threads int) erro
 			ePairs := pairs[last : i+1]
 			num, size, last = 0, 0, i+1
 			eg.Go(func() error {
-				return m.txn(egCtx, func(tx *kvTxn) error {
+				return m.txn(WrapContext(egCtx), func(tx *kvTxn) error {
 					for _, ep := range ePairs {
 						tx.set(ep.key, ep.value)
 					}
@@ -559,13 +619,33 @@ func (m *kvMeta) loadXattrs(ctx Context, msg proto.Message, pairs *[]*pair) {
 
 func (m *kvMeta) loadQuota(ctx Context, msg proto.Message, pairs *[]*pair) {
 	batch := msg.(*pb.Batch)
-	for _, q := range batch.Quotas {
+
+	storeQ := func(q *pb.Quota, key []byte) {
 		b := utils.NewBuffer(32)
 		b.Put64(uint64(q.MaxSpace))
 		b.Put64(uint64(q.MaxInodes))
 		b.Put64(uint64(q.UsedSpace))
 		b.Put64(uint64(q.UsedInodes))
-		*pairs = append(*pairs, &pair{m.dirQuotaKey(Ino(q.Inode)), b.Bytes()})
+		*pairs = append(*pairs, &pair{key, b.Bytes()})
+	}
+
+	for _, q := range batch.Quotas {
+		switch q.Type {
+		case uint32(DirQuotaType):
+			storeQ(q, m.dirQuotaKey(Ino(q.Key)))
+		case uint32(UserQuotaType):
+			storeQ(q, m.userQuotaKey(q.Key))
+		case uint32(GroupQuotaType):
+			storeQ(q, m.groupQuotaKey(q.Key))
+		default:
+			logger.Warnf("unknown quota type: %d", q.Type)
+		}
+	}
+	for _, q := range batch.UserQuotas {
+		storeQ(q, m.userQuotaKey(q.Key))
+	}
+	for _, q := range batch.GroupQuotas {
+		storeQ(q, m.groupQuotaKey(q.Key))
 	}
 }
 

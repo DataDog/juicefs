@@ -18,6 +18,7 @@ package meta
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"path"
@@ -36,10 +37,11 @@ import (
 )
 
 const (
-	aclCounter     = "aclMaxId"
-	usedSpace      = "usedSpace"
-	totalInodes    = "totalInodes"
-	legacySessions = "sessions"
+	aclCounter      = "aclMaxId"
+	usedSpace       = "usedSpace"
+	totalInodes     = "totalInodes"
+	legacySessions  = "sessions"
+	krbTokenCounter = "krbTokenMaxId"
 )
 
 var counterNames = []string{usedSpace, totalInodes, "nextInode", "nextChunk", "nextSession", "nextTrash"}
@@ -58,6 +60,9 @@ const (
 	CLONE_MODE_CAN_OVERWRITE      = 0x01
 	CLONE_MODE_PRESERVE_ATTR      = 0x02
 	CLONE_MODE_PRESERVE_HARDLINKS = 0x08
+
+	// clone concurrency
+	CLONE_DEFAULT_CONCURRENCY = 4
 
 	// atime mode
 	NoAtime     = "noatime"
@@ -106,6 +111,25 @@ func (qm *queryMap) duration(key, originalKey string, d time.Duration) time.Dura
 	}
 }
 
+func (qm *queryMap) getInt(key, originalKey string, defaultValue int) int {
+	val := qm.Get(key)
+	if val == "" {
+		oVal := qm.Get(originalKey)
+		if oVal == "" {
+			return defaultValue
+		}
+		val = oVal
+	}
+
+	qm.Del(key)
+	if i, err := strconv.ParseInt(val, 10, 32); err == nil {
+		return int(i)
+	} else {
+		logger.Warnf("Parse int %s for key %s: %s", val, key, err)
+		return defaultValue
+	}
+}
+
 func (qm *queryMap) pop(key string) string {
 	defer qm.Del(key)
 	return qm.Get(key)
@@ -117,6 +141,9 @@ func errno(err error) syscall.Errno {
 	}
 	if err == context.Canceled {
 		return syscall.EINTR
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return syscall.ETIMEDOUT
 	}
 	if eno, ok := err.(syscall.Errno); ok {
 		return eno
@@ -277,14 +304,7 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *
 		}
 		var wg sync.WaitGroup
 		var status syscall.Errno
-		// try directories first to increase parallel
-		var dirs int
-		for i, e := range entries {
-			if e.Attr.Typ == TypeDirectory {
-				entries[dirs], entries[i] = entries[i], entries[dirs]
-				dirs++
-			}
-		}
+		var nonDirEntries []*Entry
 		for i, e := range entries {
 			if e.Attr.Typ == TypeDirectory {
 				select {
@@ -305,13 +325,7 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *
 					}
 				}
 			} else {
-				if count != nil {
-					atomic.AddUint64(count, 1)
-				}
-				if st := m.Unlink(ctx, inode, string(e.Name), skipCheckTrash); st != 0 && st != syscall.ENOENT {
-					ctx.Cancel()
-					return st
-				}
+				nonDirEntries = append(nonDirEntries, e)
 			}
 			if ctx.Canceled() {
 				return syscall.EINTR
@@ -319,6 +333,11 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *
 			entries[i] = nil // release memory
 		}
 		wg.Wait()
+
+		if status == 0 {
+			status = m.BatchUnlink(ctx, inode, nonDirEntries, count, skipCheckTrash)
+		}
+
 		if status != 0 || inode == TrashInode { // try only once for .trash
 			return status
 		}
@@ -604,11 +623,20 @@ func relatimeNeedUpdate(attr *Attr, now time.Time) bool {
 
 type txMethodKey struct{}
 
+type txMethod string
+
+func (m *txMethod) name(ctx context.Context) string {
+	if *m == "" {
+		*m = txMethod(callerName(ctx)) // lazy evaluation
+	}
+	return string(*m)
+}
+
 func callerName(ctx context.Context) string {
 	if method, ok := ctx.Value(txMethodKey{}).(string); ok {
 		return method // Fast path, prefer explicitly provided method name
 	}
-	const minSkip = 2
+	const minSkip = 3
 	for i := minSkip; i < 20; i++ { // Slow path, find the real caller
 		pc, _, _, ok := runtime.Caller(i)
 		if !ok {

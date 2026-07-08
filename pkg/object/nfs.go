@@ -24,7 +24,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"os/user"
 	"path"
@@ -176,7 +175,7 @@ func (n *nfsStore) Put(ctx context.Context, key string, in io.Reader, getters ..
 		if len(name) > 200 {
 			name = name[:200]
 		}
-		tmp = path.Join(path.Dir(p), fmt.Sprintf(".%s.tmp.%d", name, rand.Int()))
+		tmp = TmpFilePath(p, name)
 		defer func() {
 			if err != nil {
 				_ = n.target.Remove(tmp)
@@ -246,7 +245,7 @@ func (n *nfsStore) fileInfo(key string, fi os.FileInfo) Object {
 	owner, group := n.getOwnerGroup(fi)
 	isSymlink := fi.Mode()&os.ModeSymlink != 0
 	ff := &file{
-		obj{key, fi.Size(), fi.ModTime(), fi.IsDir(), ""},
+		obj{key, fi.Size(), fi.ModTime(), fi.IsDir(), "", ""},
 		owner,
 		group,
 		fi.Mode(),
@@ -271,31 +270,40 @@ func (n *nfsStore) readDirSorted(ctx context.Context, dir string, followLink boo
 	if err != nil {
 		return nil, errors.Wrapf(err, "readdir %s", dirname)
 	}
-	nfsEntries := make([]*nfsEntry, len(entries))
-	for i, e := range entries {
+	nfsEntries := make([]*nfsEntry, 0, len(entries))
+	for _, e := range entries {
+		isSymlink := e.Attr.Attr.Type == nfs.NF3Lnk
 		if e.IsDir() {
-			nfsEntries[i] = &nfsEntry{e, e.Name() + dirSuffix, nil, false}
-		} else if e.Attr.Attr.Type == nfs.NF3Lnk && followLink {
+			nfsEntries = append(nfsEntries, &nfsEntry{e, e.Name() + dirSuffix, nil, false})
+		} else if isSymlink && followLink {
 			// follow symlink
-			nfsEntries[i] = &nfsEntry{e, e.Name(), nil, true}
 			src, err := n.Readlink(path.Join(dirname, e.Name()))
 			if err != nil {
+				nfsEntries = append(nfsEntries, &nfsEntry{e, e.Name(), nil, true})
 				logger.Errorf("readlink %s: %s", e.Name(), err)
 				continue
 			}
 			srcPath := path.Clean(path.Join(dirname, src))
 			fi, _, err := n.target.Lookup(srcPath)
 			if err != nil {
+				nfsEntries = append(nfsEntries, &nfsEntry{e, e.Name(), nil, true})
 				logger.Warnf("follow link `%s`: lookup `%s`: %s", path.Join(dirname, e.Name()), srcPath, err)
 				continue
 			}
 			name := e.Name()
 			if fi.IsDir() {
 				name = e.Name() + dirSuffix
+			} else if !fi.Mode().IsRegular() {
+				logger.Warnf("%s is not a regular file, ignore it", name)
+				continue
 			}
-			nfsEntries[i] = &nfsEntry{e, name, fi, false}
+			nfsEntries = append(nfsEntries, &nfsEntry{e, name, fi, false})
 		} else {
-			nfsEntries[i] = &nfsEntry{e, e.Name(), nil, e.Attr.Attr.Type == nfs.NF3Lnk}
+			if !isSymlink && !e.Mode().IsRegular() {
+				logger.Warnf("%s is not a regular file, ignore it", e.Name())
+				continue
+			}
+			nfsEntries = append(nfsEntries, &nfsEntry{e, e.Name(), nil, isSymlink})
 		}
 	}
 	sort.Slice(nfsEntries, func(i, j int) bool { return nfsEntries[i].Name() < nfsEntries[j].Name() })
@@ -465,7 +473,7 @@ func newNFSStore(addr, username, pass, token string) (ObjectStorage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to dial MOUNT service %s: %v", addr, err)
 	}
-	auth := rpc.NewAuthUnix(username, uint32(os.Getuid()), uint32(os.Getgid()))
+	auth := rpc.NewAuthUnix(username, uint32(utils.GetCurrentUID()), uint32(utils.GetCurrentGID()))
 	target, err := mount.Mount(path, auth.Auth())
 	target.Config.DirCount = 1 << 17
 	// Readdir returns up to 1M at a time, even if MaxCount is set larger

@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"math/rand"
 	"os"
 	"os/user"
 	"path"
@@ -79,6 +78,7 @@ func (h *hdfsclient) toFile(key string, info os.FileInfo) *file {
 			info.ModTime(),
 			info.IsDir(),
 			"",
+			"",
 		},
 		hinfo.Owner(),
 		hinfo.OwnerGroup(),
@@ -112,7 +112,8 @@ func (h *hdfsclient) Get(ctx context.Context, key string, off, limit int64, gett
 	}
 
 	finfo := f.Stat()
-	if finfo.IsDir() {
+	if finfo.IsDir() || off >= finfo.Size() {
+		_ = f.Close()
 		return io.NopCloser(bytes.NewBuffer([]byte{})), nil
 	}
 
@@ -138,7 +139,7 @@ func (h *hdfsclient) Put(ctx context.Context, key string, in io.Reader, getters 
 		if len(name) > 200 {
 			name = name[:200]
 		}
-		tmp = path.Join(path.Dir(p), fmt.Sprintf(".%s.tmp.%d", name, rand.Int()))
+		tmp = TmpFilePath(p, name)
 		defer func() {
 			if err != nil {
 				_ = h.c.Remove(tmp)

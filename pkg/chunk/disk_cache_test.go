@@ -17,6 +17,7 @@
 package chunk
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
+	"github.com/vmihailenco/msgpack/v5"
 
 	. "github.com/bytedance/mockey"
 	. "github.com/smartystreets/goconvey/convey"
@@ -115,7 +117,7 @@ func TestMetrics(t *testing.T) {
 		t.Fatalf("expect the stageBlockBytes is %d", len(content))
 	}
 	key := fmt.Sprintf("chunks/0/5/5000_2_%d", len(content))
-	stagingPath, err := m.stage(key, content)
+	stagingPath, err := m.stage(key, content, 0)
 	if err != nil {
 		t.Fatalf("stage failed: %s", err)
 	}
@@ -142,6 +144,31 @@ func TestMetrics(t *testing.T) {
 	if _, err := os.Stat(stagingPath); err != nil && !os.IsNotExist(err) {
 		t.Fatalf("expect the stageingPath %s not exists", stagingPath)
 	}
+}
+
+func TestScanCached(t *testing.T) {
+	var err error
+	cfg := defaultConf
+	cfg.CacheEviction = EvictionNone
+	cache := &cacheStore{
+		opTs: make(map[time.Duration]func() error),
+	}
+	cache.state = newDCState(dcUnchanged, cache)
+	cache.keys, err = NewKeyIndex(&cfg)
+	require.NoError(t, err)
+	cache.dir = t.TempDir()
+	rawDir := filepath.Join(cache.dir, cacheDir)
+	if err := os.MkdirAll(rawDir, 0755); err != nil {
+		t.Fatalf("mkdir %s: %s", rawDir, err)
+	}
+	num := 10
+	for i := 0; i < num; i++ {
+		if f, err := os.Create(filepath.Join(rawDir, fmt.Sprintf("test%d_1024", i))); err == nil {
+			_ = f.Close()
+		}
+	}
+	cache.scanCached(true)
+	require.Equal(t, num, cache.keys.len())
 }
 
 func TestChecksum(t *testing.T) {
@@ -349,11 +376,9 @@ func shutdownStore(s *cacheStore) {
 
 func TestCacheManager(t *testing.T) {
 	conf := defaultConf
-	conf.CacheDir = "/tmp/diskCache0:/tmp/diskCache1:/tmp/diskCache2"
+	dir0, dir1, dir2 := t.TempDir(), t.TempDir(), t.TempDir()
+	conf.CacheDir = dir0 + ":" + dir1 + ":" + dir2
 	conf.AutoCreate = true
-	defer os.RemoveAll("/tmp/diskCache0")
-	defer os.RemoveAll("/tmp/diskCache1")
-	defer os.RemoveAll("/tmp/diskCache2")
 	manager := newCacheManager(&conf, nil, nil)
 	require.True(t, !manager.isEmpty())
 
@@ -417,6 +442,7 @@ func TestAtimeNotLost(t *testing.T) {
 	for _, eviction := range []string{EvictionNone, Eviction2Random, EvictionLRU} {
 		cfg := defaultConf
 		cfg.CacheEviction = eviction
+		cfg.FreeSpace = 0.03
 		m := newCacheManager(&cfg, nil, nil)
 		key := "0_0_10"
 
@@ -434,7 +460,7 @@ func TestAtimeNotLost(t *testing.T) {
 		if atimeMem == 0 {
 			t.Fatalf("CacheStore key %s atime lost", key)
 		}
-		s.scanCached() // should use atime from memory
+		s.scanCached(false) // should use atime from memory
 		atimeAfterScan := s.keys.peekAtime(s.getCacheKey(key))
 		if atimeAfterScan != atimeMem {
 			t.Fatalf("CacheStore key %s atime lost after scan, before: %d, after: %d", key, atimeMem, atimeAfterScan)
@@ -461,6 +487,39 @@ func TestSetlimitByFreeRatio(t *testing.T) {
 	if cache.maxItems > expectedInodeLimit && cache.maxItems != 0 {
 		t.Fatalf("Expected maxItems <= %d, but got %d", expectedInodeLimit, cache.maxItems)
 	}
+}
+
+func TestSetLimitByFreeRatioUnknownInodesKeepExplicitMaxItems(t *testing.T) {
+	conf := testConf()
+	defer os.RemoveAll(conf.CacheDir)
+	cache := newCacheStore(nil, conf.CacheDir, 1<<30, 1000, 1, &conf, nil)
+
+	usage := DiskFreeRatio{
+		spaceCap: 1 << 30,
+		inodeCap: 0,
+	}
+	cache.setLimitByFreeRatio(usage, 0.2)
+	require.Equal(t, int64(1000), cache.maxItems)
+}
+
+func TestUnknownInodeStatsShouldNotMarkCacheAsRawFull(t *testing.T) {
+	PatchConvey("unknown inode stats should not trigger rawFull", t, func() {
+		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
+			return 1 << 30, 1 << 30, 0, 0
+		}).Build()
+
+		conf := defaultConf
+		conf.CacheDir = t.TempDir()
+		m := new(cacheManagerMetrics)
+		m.initMetrics()
+		s := newCacheStore(m, conf.CacheDir, 1<<30, conf.CacheItems, 1, &conf, nil)
+
+		require.Never(t, func() bool {
+			s.Lock()
+			defer s.Unlock()
+			return s.rawFull
+		}, 1500*time.Millisecond, 100*time.Millisecond)
+	})
 }
 
 func Test2RandomEviction(t *testing.T) {
@@ -567,7 +626,7 @@ func TestLruEviction(t *testing.T) {
 		blockPlaceHolder := []byte("test data")
 		for i := 1; i <= 20; i++ {
 			key := fmt.Sprintf("%d_%d_9", i, i)
-			_, err := s.stage(key, blockPlaceHolder)
+			_, err := s.stage(key, blockPlaceHolder, 0)
 			require.True(t, le.verifyHeap())
 			require.NoError(t, err, "Failed to stage data for key %s", key)
 		}
@@ -596,20 +655,376 @@ func TestCooldownAtimeOnWriteFixedOnLoad(t *testing.T) {
 	dir := t.TempDir()
 	conf := defaultConf
 	conf.CacheExpire = time.Hour
+	conf.CacheEviction = EvictionNone
+	conf.CacheScanInterval = -1
 	m := new(cacheManagerMetrics)
 	m.initMetrics()
 	cache := newCacheStore(m, dir, 1<<30, 1000, 1, &conf, nil)
+	cache.scanned = true
 	key := "0_0_4"
 
-	now := time.Now()
-	path, err := cache.stage(key, []byte("test"))
-	require.NoError(t, err)
-	require.NotEmpty(t, path)
-	require.LessOrEqual(t, cache.keys.peekAtime(cache.getCacheKey(key)), uint32(now.Add(-conf.CacheExpire/2).Unix())) // should have bias in atime
+	PatchConvey("mock time.Now to avoid drift", t, func() {
+		fixedTime := time.Date(2025, 1, 28, 12, 0, 0, 0, time.UTC)
+		Mock(time.Now).Return(fixedTime).Build()
+		path, err := cache.stage(key, []byte("test"), 0)
+		require.NoError(t, err)
+		require.NotEmpty(t, path)
+		expectedCooldownAtime := uint32(fixedTime.Add(-conf.CacheExpire / 2).Unix())
+		require.Equal(t, expectedCooldownAtime, cache.keys.peekAtime(cache.getCacheKey(key)))
+		rc, err := cache.load(key)
+		require.NoError(t, err)
+		require.NotNil(t, rc)
+		defer rc.Close()
+		require.Equal(t, uint32(fixedTime.Unix()), cache.keys.peekAtime(cache.getCacheKey(key)))
+	})
+}
 
-	rc, err := cache.load(key)
+func newTestCacheStore(dir string, conf *Config, uploader func(key, path string, force bool) bool) *cacheStore {
+	keyIndex, _ := NewKeyIndex(conf)
+	c := &cacheStore{
+		dir:       dir,
+		mode:      0600,
+		capacity:  1 << 30,
+		freeRatio: conf.FreeSpace,
+		keys:      keyIndex,
+		pending:   make(chan pendingFile, 10),
+		pages:     make(map[string]*Page),
+		uploader:  uploader,
+		opTs:      make(map[time.Duration]func() error),
+		scanned:   true,
+	}
+	c.state = newDCState(dcNormal, c)
+	return c
+}
+
+func TestUploadStagingToFreeCalculation(t *testing.T) {
+	PatchConvey("uploadStaging should only upload enough blocks to satisfy freeRatio", t, func() {
+		dir := t.TempDir()
+		conf := defaultConf
+		conf.FreeSpace = 0.10
+		conf.CacheEviction = EvictionNone
+
+		var uploadedKeys []string
+		uploader := func(key, path string, force bool) bool {
+			uploadedKeys = append(uploadedKeys, key)
+			return true
+		}
+
+		s := newTestCacheStore(dir+"/", &conf, uploader)
+		for i := 0; i < 10; i++ {
+			key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
+			k := s.getCacheKey(key)
+			s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix()) - uint32(i*60)})
+		}
+
+		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
+			return 100000, 5000, 100000, 100000
+		}).Build()
+
+		s.uploadStaging()
+		uploaded := len(uploadedKeys)
+		require.LessOrEqual(t, uploaded, 5)
+		require.Greater(t, uploaded, 0, "should upload at least some blocks when disk is tight")
+	})
+}
+
+func TestUploadStagingInodeToFree(t *testing.T) {
+	PatchConvey("uploadStaging respects inode pressure", t, func() {
+		dir := t.TempDir()
+		conf := defaultConf
+		conf.FreeSpace = 0.10
+		conf.CacheEviction = EvictionNone
+
+		var uploadCount int
+		uploader := func(key, path string, force bool) bool {
+			uploadCount++
+			return true
+		}
+		s := newTestCacheStore(dir+"/", &conf, uploader)
+
+		for i := 0; i < 10; i++ {
+			key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
+			k := s.getCacheKey(key)
+			s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix()) - uint32(i*60)})
+		}
+
+		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
+			return 100000, 20000, 1000, 50
+		}).Build()
+		s.uploadStaging()
+		count := uploadCount
+		require.Greater(t, count, 0, "should upload blocks when inodes are tight")
+	})
+}
+
+func TestSpaceToFreeNoAction(t *testing.T) {
+	PatchConvey("uploadStaging does nothing when disk has enough space", t, func() {
+		dir := t.TempDir()
+		conf := defaultConf
+		conf.FreeSpace = 0.10
+		conf.CacheEviction = EvictionNone
+
+		var uploadCount int
+		uploader := func(key, path string, force bool) bool {
+			uploadCount++
+			return true
+		}
+
+		s := newTestCacheStore(dir+"/", &conf, uploader)
+
+		for i := 0; i < 5; i++ {
+			key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
+			k := s.getCacheKey(key)
+			s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix())})
+		}
+
+		// Mock: 20% free space, 20% free inodes - both above freeRatio (10%)
+		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
+			return 100000, 20000, 100000, 20000
+		}).Build()
+
+		s.uploadStaging()
+		require.Equal(t, 0, uploadCount, "should not upload when disk has enough free space and inodes")
+	})
+}
+
+func TestOpenCacheFileReads(t *testing.T) {
+	cases := []struct {
+		name        string
+		dataSize    int
+		hasChecksum bool
+		hasFooter   bool
+		tier        uint8
+		openLevel   string
+		wantCsLevel string
+		wantTier    uint8
+	}{
+		{name: "data only", dataSize: 64 << 10, openLevel: CsFull, wantCsLevel: CsNone},
+		{name: "checksum only", dataSize: 64 << 10, hasChecksum: true, openLevel: CsFull, wantCsLevel: CsFull},
+		{name: "checksum and tier", dataSize: 64 << 10, hasChecksum: true, hasFooter: true, tier: 2, openLevel: CsFull, wantCsLevel: CsFull, wantTier: 2},
+		{name: "tier only", dataSize: 1 << 10, hasFooter: true, tier: 3, openLevel: CsNone, wantCsLevel: CsNone, wantTier: 3},
+		// Regression: 80KiB data => checksumLength = 12 bytes, close to the
+		// trailer size; a tier-only file must not be mistaken for checksum-only.
+		{name: "tier without checksum no collision", dataSize: 80 << 10, hasFooter: true, tier: 2, openLevel: CsExtend, wantCsLevel: CsNone, wantTier: 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			data := make([]byte, c.dataSize)
+			utils.RandRead(data)
+
+			path := filepath.Join(t.TempDir(), "cache")
+			f, err := os.Create(path)
+			require.NoError(t, err)
+			_, err = f.Write(data)
+			require.NoError(t, err)
+			if c.hasChecksum {
+				_, err = f.Write(checksum(data))
+				require.NoError(t, err)
+			}
+			if c.hasFooter {
+				_, err = f.Write(marshalFooter(t, c.tier, c.hasChecksum))
+				require.NoError(t, err)
+			}
+			require.NoError(t, f.Close())
+
+			cf, err := openCacheFile(path, len(data), c.openLevel)
+			require.NoError(t, err)
+			defer cf.Close()
+			require.Equal(t, c.wantCsLevel, cf.csLevel)
+
+			got := make([]byte, len(data))
+			n, err := cf.ReadAt(got, 0)
+			require.NoError(t, err)
+			require.Equal(t, len(data), n)
+			require.Equal(t, data, got)
+
+			var ft stageFooter
+			if c.hasFooter {
+				require.NotZero(t, cf.footerOff)
+				require.NoError(t, ft.unmarshal(cf))
+				require.Equal(t, c.wantTier, ft.Tier)
+			} else {
+				// A file without a footer defaults to tier 0.
+				require.Zero(t, cf.footerOff)
+				require.NoError(t, ft.unmarshal(cf))
+				require.Equal(t, uint8(0), ft.Tier)
+			}
+		})
+	}
+}
+
+func marshalFooter(t *testing.T, tier uint8, hasChecksum bool) []byte {
+	t.Helper()
+	f := stageFooter{Tier: tier}
+	b, err := f.marshal(hasChecksum)
 	require.NoError(t, err)
-	require.NotNil(t, rc)
-	defer rc.Close()
-	require.GreaterOrEqual(t, cache.keys.peekAtime(cache.getCacheKey(key)), uint32(now.Unix())) // bias should have been fixed on load
+	return b
+}
+
+// decodeStageFooter parses a marshaled footer ([magic][len][msgpack]) and
+// returns the decoded metadata, verifying the framing along the way.
+func decodeStageFooter(t *testing.T, b []byte) stageFooter {
+	t.Helper()
+	require.GreaterOrEqual(t, len(b), 4)
+	require.Equal(t, stageFooterMagic, binary.BigEndian.Uint16(b[:2]))
+	size := int(binary.BigEndian.Uint16(b[2:4]))
+	require.Equal(t, size, len(b)-4)
+	var m stageFooter
+	require.NoError(t, msgpack.Unmarshal(b[4:], &m))
+	return m
+}
+
+func TestEncodeStageFooterLengthParity(t *testing.T) {
+	// The encoded length must be a multiple of 4 iff a checksum is present, and
+	// the stored tier must round-trip regardless of the padding.
+	for tier := uint8(0); tier <= maxTierID; tier++ {
+		for _, hasChecksum := range []bool{true, false} {
+			b := marshalFooter(t, tier, hasChecksum)
+			require.Equal(t, hasChecksum, len(b)%4 == 0,
+				"tier=%d hasChecksum=%v len=%d", tier, hasChecksum, len(b))
+
+			require.Equal(t, tier, decodeStageFooter(t, b).Tier)
+		}
+	}
+}
+
+func TestOpenCacheFileRejectsInvalidSize(t *testing.T) {
+	cases := []struct {
+		name      string
+		dataSize  int
+		truncate  int    // bytes dropped from the end of the data
+		trailer   []byte // extra bytes appended after the data
+		openLevel string
+	}{
+		{
+			// 40KiB data => checksumLength = 8 bytes; an "extra" that is a
+			// multiple of 4 but smaller than the checksum length is impossible.
+			name:      "extra smaller than checksum",
+			dataSize:  40 << 10,
+			trailer:   []byte{0, 0, 0, 0},
+			openLevel: CsFull,
+		},
+		{
+			name:      "truncated data",
+			dataSize:  1 << 10,
+			truncate:  1,
+			openLevel: CsNone,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			data := make([]byte, c.dataSize)
+			utils.RandRead(data)
+
+			content := make([]byte, 0, len(data))
+			content = append(content, data[:len(data)-c.truncate]...)
+			content = append(content, c.trailer...)
+			path := filepath.Join(t.TempDir(), "cache")
+			require.NoError(t, os.WriteFile(path, content, 0600))
+
+			_, err := openCacheFile(path, len(data), c.openLevel)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestOpenCacheFileParsesStageFooter(t *testing.T) {
+	data := make([]byte, 1024)
+	utils.RandRead(data)
+
+	badMagic := marshalFooter(t, 2, false)
+	badMagic[0] ^= 0xff // corrupt the magic without changing the length
+
+	cases := []struct {
+		name     string
+		footer   []byte
+		wantErr  bool
+		wantTier uint8
+	}{
+		{name: "truncated header", footer: []byte{0x46}, wantErr: true},                                // shorter than the 4-byte header
+		{name: "bad magic", footer: badMagic, wantErr: true},                                           // valid length, wrong magic
+		{name: "trailing data", footer: append(marshalFooter(t, 2, false), 0, 0, 0, 0), wantErr: true}, // extra bytes after the footer
+		{name: "invalid tier clamped to zero", footer: marshalFooter(t, 9, false), wantTier: 0},        // out-of-range tier -> default
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "cache")
+			f, err := os.Create(path)
+			require.NoError(t, err)
+			_, err = f.Write(data)
+			require.NoError(t, err)
+			_, err = f.Write(c.footer)
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+
+			// openCacheFile only validates sizes; the footer content is
+			// validated when it is unmarshaled.
+			cf, err := openCacheFile(path, len(data), CsNone)
+			require.NoError(t, err)
+			defer cf.Close()
+
+			var ft stageFooter
+			err = ft.unmarshal(cf)
+			if c.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, c.wantTier, ft.Tier)
+		})
+	}
+}
+
+// writeStageFile writes a stage file laid out as [data][checksum?][footer] and
+// returns its path.
+func writeStageFile(tb testing.TB, dir, name string, data []byte, tier uint8, hasChecksum bool) string {
+	tb.Helper()
+	path := filepath.Join(dir, name)
+	f, err := os.Create(path)
+	require.NoError(tb, err)
+	_, err = f.Write(data)
+	require.NoError(tb, err)
+	if hasChecksum {
+		_, err = f.Write(checksum(data))
+		require.NoError(tb, err)
+	}
+	sf := stageFooter{Tier: tier}
+	fb, err := sf.marshal(hasChecksum)
+	require.NoError(tb, err)
+	_, err = f.Write(fb)
+	require.NoError(tb, err)
+	require.NoError(tb, f.Close())
+	return path
+}
+
+func TestStageFooterRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	data := make([]byte, 64*1024)
+	utils.RandRead(data)
+	for tier := uint8(0); tier <= maxTierID; tier++ {
+		for _, hasChecksum := range []bool{true, false} {
+			name := fmt.Sprintf("tier%d_cs%v", tier, hasChecksum)
+			t.Run(name, func(t *testing.T) {
+				path := writeStageFile(t, dir, name, data, tier, hasChecksum)
+				level := CsNone
+				if hasChecksum {
+					level = CsFull
+				}
+
+				cf, err := openCacheFile(path, len(data), level)
+				require.NoError(t, err)
+				defer cf.Close()
+
+				got := make([]byte, len(data))
+				n, err := cf.ReadAt(got, 0)
+				require.NoError(t, err)
+				require.Equal(t, len(data), n)
+				require.Equal(t, data, got)
+
+				var ft stageFooter
+				require.NoError(t, ft.unmarshal(cf))
+				require.Equal(t, tier, ft.Tier)
+			})
+		}
+	}
 }

@@ -29,14 +29,16 @@ type Object interface {
 	IsDir() bool
 	IsSymlink() bool
 	StorageClass() string
+	Status() string
 }
 
 type obj struct {
-	key   string
-	size  int64
-	mtime time.Time
-	isDir bool
-	sc    string
+	key    string
+	size   int64
+	mtime  time.Time
+	isDir  bool
+	sc     string
+	status string
 }
 
 func (o *obj) Key() string          { return o.key }
@@ -45,10 +47,11 @@ func (o *obj) Mtime() time.Time     { return o.mtime }
 func (o *obj) IsDir() bool          { return o.isDir }
 func (o *obj) IsSymlink() bool      { return false }
 func (o *obj) StorageClass() string { return o.sc }
+func (o *obj) Status() string       { return o.status }
 
 type MultipartUpload struct {
-	MinPartSize int
-	MaxCount    int
+	MinPartSize int64
+	MaxCount    int64
 	UploadID    string
 }
 
@@ -67,9 +70,9 @@ type PendingPart struct {
 type Limits struct {
 	IsSupportMultipartUpload bool
 	IsSupportUploadPartCopy  bool
-	MinPartSize              int
+	MinPartSize              int64
 	MaxPartSize              int64
-	MaxPartCount             int
+	MaxPartCount             int64
 }
 
 // ObjectStorage is the interface for object storage.
@@ -109,6 +112,8 @@ type ObjectStorage interface {
 	CompleteUpload(ctx context.Context, key string, uploadID string, parts []*Part) error
 	// ListUploads lists existing multipart uploads.
 	ListUploads(ctx context.Context, marker string) ([]*PendingPart, string, error)
+	// Restore restores an archived object to be available for read.
+	Restore(ctx context.Context, key string, days int32) error
 }
 
 type Shutdownable interface {
@@ -124,6 +129,8 @@ func Shutdown(o ObjectStorage) {
 
 	switch o := o.(type) {
 	case *encrypted:
+		fn(o.ObjectStorage)
+	case *chunkedEncrypted:
 		fn(o.ObjectStorage)
 	case *withPrefix:
 		fn(o.os)

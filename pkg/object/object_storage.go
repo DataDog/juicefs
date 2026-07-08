@@ -20,7 +20,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +46,10 @@ type SupportSymlink interface {
 	Symlink(oldName, newName string) error
 	// Readlink read a symbolic link
 	Readlink(name string) (string, error)
+}
+
+type SupportUploadPartStream interface {
+	UploadPartStream(key string, uploadID string, num int, in io.Reader) (*Part, error)
 }
 
 type File interface {
@@ -105,7 +112,7 @@ type FileSystem interface {
 	Chown(path string, owner, group string) error
 }
 
-var notSupported = utils.ENOTSUP
+var notSupported = utils.ErrNotSUP
 
 type DefaultObjectStorage struct{}
 
@@ -117,7 +124,7 @@ func (s DefaultObjectStorage) Limits() Limits {
 	return Limits{IsSupportMultipartUpload: false, IsSupportUploadPartCopy: false}
 }
 
-func (s DefaultObjectStorage) Head(key string) (Object, error) {
+func (s DefaultObjectStorage) Head(ctx context.Context, key string) (Object, error) {
 	return nil, notSupported
 }
 
@@ -155,12 +162,21 @@ func (s DefaultObjectStorage) ListAll(ctx context.Context, prefix, marker string
 	return nil, notSupported
 }
 
+func (s DefaultObjectStorage) Restore(ctx context.Context, key string, days int32) error {
+	return notSupported
+}
+
 type Creator func(bucket, accessKey, secretKey, token string) (ObjectStorage, error)
 
 var storages = make(map[string]Creator)
 
 func Register(name string, register Creator) {
 	storages[name] = register
+}
+
+func IsSupported(name string) bool {
+	_, ok := storages[name]
+	return ok
 }
 
 func CreateStorage(name, endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
@@ -190,8 +206,22 @@ type listThread struct {
 	hasMore   bool
 }
 
+func (l *listThread) reset() {
+	l.err = nil
+	l.entries = nil
+	l.nextToken = ""
+	l.hasMore = false
+}
+
 func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, start, end string, followLink bool) (<-chan Object, error) {
-	entries, _, _, err := store.List(ctx, prefix, start, "", "/", 1e9, followLink)
+	marker := start
+	if start != "" && strings.HasPrefix(start, prefix) {
+		remaining := start[len(prefix):]
+		if idx := strings.Index(remaining, "/"); idx >= 0 {
+			marker = prefix + remaining[:idx]
+		}
+	}
+	entries, _, _, err := store.List(ctx, prefix, marker, "", "/", 1e9, followLink)
 	if err != nil {
 		logger.Errorf("list %s: %s", prefix, err)
 		return nil, err
@@ -218,7 +248,7 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 					if !entries[i].IsDir() || key == prefix {
 						continue
 					}
-					t.entries, t.hasMore, t.nextToken, t.err = store.List(ctx, key, "\x00", t.nextToken, "/", 1e9, followLink) // exclude itself
+					t.entries, t.hasMore, t.nextToken, t.err = store.List(ctx, key, "\x00", t.nextToken, "/", 1000, followLink) // exclude itself
 					t.Lock()
 					t.ready = true
 					t.cond.Signal()
@@ -258,9 +288,21 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 				t.Unlock()
 				return err
 			}
+			for t.hasMore {
+				var more []Object
+				startAfter := t.entries[len(t.entries)-1].Key()
+				more, t.hasMore, t.nextToken, t.err = store.List(ctx, key, startAfter, t.nextToken, "/", 1e9, followLink)
+				if t.err != nil {
+					err = t.err
+					t.Unlock()
+					return err
+				}
+				t.entries = append(t.entries, more...)
+			}
 			t.ready = false
 			t.cond.Signal()
 			children := t.entries
+			t.reset()
 			t.Unlock()
 
 			err = walk(key, children)
@@ -287,4 +329,102 @@ func generateListResult(objs []Object, limit int64) ([]Object, bool, string, err
 		nextMarker = objs[len(objs)-1].Key()
 	}
 	return objs, len(objs) == int(limit), nextMarker, nil
+}
+
+func decodeKey(value string, typ *string) (string, error) {
+	if typ != nil && *typ == "url" {
+		return url.QueryUnescape(value)
+	}
+	return value, nil
+}
+
+func TmpFilePath(parent, name string) string {
+	return filepath.Join(filepath.Dir(parent), ".jfs."+name+".tmp."+strconv.Itoa(rand.Int()))
+}
+
+type TierKey struct{}
+
+const DefaultRestoreDays = 3
+
+type SupportTier interface {
+	InitTiers(init Tiers) error
+	GetTier(ctx context.Context) Tier
+}
+
+type tierStorage struct {
+	tiers map[uint8]Tier
+}
+
+func (b *tierStorage) GetTier(ctx context.Context) Tier {
+	if id, ok := ctx.Value(TierKey{}).(uint8); ok {
+		if t, ok := b.tiers[id]; ok {
+			return t
+		}
+		logger.Warnf("invalid tier id: %d", id)
+	}
+	return b.tiers[0]
+}
+
+func (b *tierStorage) InitTiers(init Tiers) error {
+	if init == nil {
+		init = NewTiers("")
+	}
+	for id, t := range init {
+		if t.Tag != "" && !ValidateTag(t.Tag) {
+			logger.Warnf("invalid tag %q for tier %d; ignore it", t.Tag, id)
+			t.encodedTag = ""
+		} else {
+			t.encodedTag = encodeTag(t.Tag)
+		}
+		init[id] = t
+	}
+	b.tiers = init
+	return nil
+}
+
+func encodeTag(tag string) string {
+	if tag == "" || !ValidateTag(tag) {
+		return ""
+	}
+	parts := strings.SplitN(tag, "=", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	return url.QueryEscape(parts[0]) + "=" + url.QueryEscape(parts[1])
+}
+
+type Tier struct {
+	ID         uint8  `json:"ID"`
+	Sc         string `json:"StorageClass"`
+	Tag        string `json:"Tag"`
+	encodedTag string
+}
+
+func ValidateTag(tag string) bool {
+	if tag == "" {
+		return true
+	}
+	if strings.Count(tag, "=") != 1 {
+		return false
+	}
+	parts := strings.SplitN(tag, "=", 2)
+	return parts[0] != "" && parts[1] != ""
+}
+
+type Tiers map[uint8]Tier
+
+func NewTiers(defaultSc string) Tiers {
+	t := make(Tiers)
+	t[0] = Tier{
+		ID: 0,
+		Sc: defaultSc,
+	}
+	return t
+}
+
+func getOrDefaultScValue(v, defaultValue string) string {
+	if v == "" {
+		return defaultValue
+	}
+	return v
 }

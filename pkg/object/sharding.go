@@ -78,14 +78,23 @@ func (s *sharded) Delete(ctx context.Context, key string, getters ...AttrGetter)
 	return s.pick(key).Delete(ctx, key, getters...)
 }
 
-func (s *sharded) SetStorageClass(sc string) error {
+func (s *sharded) InitTiers(init Tiers) error {
 	var err = notSupported
 	for _, o := range s.stores {
-		if os, ok := o.(SupportStorageClass); ok {
-			err = os.SetStorageClass(sc)
+		if o, ok := o.(SupportTier); ok {
+			err = o.InitTiers(init)
 		}
 	}
 	return err
+}
+
+func (s *sharded) GetTier(ctx context.Context) Tier {
+	for _, o := range s.stores {
+		if o, ok := o.(SupportTier); ok {
+			return o.GetTier(ctx)
+		}
+	}
+	return Tier{}
 }
 
 const maxResults = 10000
@@ -212,6 +221,10 @@ func (s *sharded) CompleteUpload(ctx context.Context, key string, uploadID strin
 	return s.pick(key).CompleteUpload(ctx, key, uploadID, parts)
 }
 
+func (s *sharded) Restore(ctx context.Context, key string, days int32) error {
+	return s.pick(key).Restore(ctx, key, days)
+}
+
 func NewSharded(name, endpoint, ak, sk, token string, shards int) (ObjectStorage, error) {
 	stores := make([]ObjectStorage, shards)
 	var err error
@@ -227,3 +240,6 @@ func NewSharded(name, endpoint, ak, sk, token string, shards int) (ObjectStorage
 	}
 	return &sharded{stores: stores}, nil
 }
+
+var _ SupportTier = (*sharded)(nil)
+var _ ObjectStorage = (*sharded)(nil)

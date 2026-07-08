@@ -25,11 +25,28 @@ When the average file is larger (over 64MB), or the file is frequently modified 
 
 When you need to migrate between two types of metadata engines, you can use this method to estimate the required storage space. For example, if you want to migrate the metadata engine from a relational database (MySQL) to a key-value database (Redis), and the current usage of MySQL is 30GB, then the target Redis needs to prepare at least 15GB or more of memory. The reverse is also true.
 
-## Redis Compatible Database
+## Redis-compatible database
 
 ### Redis
 
 JuiceFS requires Redis version 4.0 and above. Redis Cluster is also supported, but in order to avoid transactions across different Redis instances, JuiceFS puts all metadata for one file system on a single Redis instance.
+
+:::tip Redis Cluster Key Prefix
+When using Redis Cluster, the database number in the URL is used as a **key prefix** rather than for actual database selection (since Redis Cluster only supports database 0). The prefix format is `{N}` (e.g., `{1}`, `{2}`), which uses Redis hash tags to ensure all keys for one volume are routed to the same slot. This allows multiple JuiceFS file systems to share a single Redis Cluster:
+
+```shell
+# Different volumes use different DB numbers as key prefixes
+juicefs format redis://cluster:6379/1 volume1   # keys prefixed with {1}
+juicefs format redis://cluster:6379/2 volume2   # keys prefixed with {2}
+```
+
+You can verify the keys in Redis Cluster using:
+
+```shell
+redis-cli -c -h <host> -p 6379 keys '{1}*'   # list all keys for volume with prefix {1}
+```
+
+:::
 
 To ensure metadata security, JuiceFS requires [`maxmemory-policy noeviction`](https://redis.io/docs/reference/eviction/), otherwise it will try to set it to `noeviction` when starting JuiceFS, and will print a warning log if it fails. Refer to [Redis Best practices](../administration/metadata/redis_best_practices.md) for more.
 
@@ -83,6 +100,12 @@ For security purposes, it is recommended to pass the password using the environm
 export META_PASSWORD=mypassword
 ```
 
+Similarly, the password can be provided from a file using:
+
+```shell
+export META_PASSWORD_FILE=/secret/mypassword.txt
+```
+
 Then there is no need to set a password in the metadata URL.
 
 ```shell
@@ -105,6 +128,13 @@ Passing passwords with the `META_PASSWORD` or `REDIS_PASSWORD` environment varia
 
 ```shell
 export META_PASSWORD=mypassword
+juicefs mount -d "redis://192.168.1.6:6379/1" /mnt/jfs
+```
+
+Similarly, the password can be provided from a file using as follows:
+
+```shell
+export META_PASSWORD_FILE=/secret/mypassword.txt
 juicefs mount -d "redis://192.168.1.6:6379/1" /mnt/jfs
 ```
 
@@ -136,17 +166,23 @@ When specifying options in a URL, start with the `?` symbol and use the `&` symb
 
 In the above example, `/etc/certs` is just a directory name. Replace it with your actual certificate directory when using it, which can be a relative or absolute path.
 
+### Valkey
+
+[Valkey](https://valkey.io) is an open-source fork of Redis, created to preserve the project's community-driven governance while remaining highly compatible with the Redis ecosystem. Valkey focuses on maintaining stability, improving performance, and continuing innovation under a neutral approach, ensuring long-term availability for users who rely on Redis-compatible workloads.
+
+When being used as the metadata storage engine for JuiceFS, Valkey functions the same way as Redis. Please refer to Valkey's [documentation](https://valkey.io/topics/installation) for installation and other aspects, as well as the [Redis](#redis) section for usage.
+
 ### KeyDB
 
-[KeyDB](https://keydb.dev) is an open source fork of Redis, developed to stay aligned with the Redis community. KeyDB implements multi-threading support, better memory utilization, and greater throughput on top of Redis, and also supports [Active Replication](https://github.com/JohnSully/KeyDB/wiki/Active-Replication), i.e., the Active Active feature.
+[KeyDB](https://keydb.dev) is an open-source fork of Redis, developed to stay aligned with the Redis community. KeyDB implements multi-threading support, better memory utilization, and greater throughput on top of Redis and also supports [Active Replication](https://docs.keydb.dev/docs/active-rep) (also known as Active-Active). KeyDB is considered compatible with Redis version 6, but it is [not actively maintained by its community](https://github.com/Snapchat/KeyDB/issues/895) at the moment.
 
 :::note
-Same as Redis, the Active Replication is asynchronous, which may cause consistency issues. So use with caution!
+The Active Replication feature is asynchronous and may cause consistency issues, so use with caution!
 :::
 
-When being used as metadata storage engine for Juice, KeyDB is used exactly in the same way as Redis. So please refer to the [Redis](#redis) section for usage.
+When being used as the metadata storage engine for JuiceFS, KeyDB functions the same way as Redis. Please refer to KeyDB's [documentation](https://docs.keydb.dev/docs) for installation and other aspects, as well as the [Redis](#redis) section for usage.
 
-## Key-Value Database
+## Key-value database
 
 ### BadgerDB
 
@@ -183,7 +219,7 @@ BadgerDB only allows single-process access. If you need to perform operations li
 By using the official tool TiUP, you can easily build a local playground for testing (refer [here](https://tikv.org/docs/latest/concepts/tikv-in-5-minutes) for details). Production environment generally requires at least three hosts to store three data replicas (refer to the [official document](https://tikv.org/docs/latest/deploy/install/install) for all deployment steps).
 
 :::note
-It's recommended to use dedicated TiKV 5.0+ cluster as the metadata engine for JuiceFS.
+It is recommended to use dedicated TiKV 5.0+ cluster as the metadata engine for JuiceFS.
 :::
 
 #### Create a file system
@@ -441,7 +477,7 @@ juicefs.fdb mount -d \
     /mnt/jfs
 ```
 
-## SQL Database
+## SQL database
 
 Each database can only be used by one JuiceFS file system by default. If you want multiple file systems to share a database, you can achieve this by adding a `table_prefix` <VersionAdd>1.3</VersionAdd> query parameter in the META-URL to add different table prefixes for different file systems.
 For example: `mysql://user:mypassword@(192.168.1.6:3306)/juicefs?table_prefix=volume1`
@@ -477,8 +513,8 @@ mysql://<username>[:<password>]@unix(<socket-file-path>)/<database-name>
 
 :::note
 
-1. Don't leave out the `()` brackets on either side of the URL.
-2. Special characters in passwords do not require url encoding
+1. Don not leave out the `()` brackets on either side of the URL.
+2. Special characters in passwords do not require URL encoding.
 
 :::
 
@@ -496,6 +532,17 @@ A more secure approach would be to pass the database password through the enviro
 
 ```shell
 export META_PASSWORD="mypassword"
+juicefs format \
+    --storage s3 \
+    ... \
+    "mysql://user@(192.168.1.6:3306)/juicefs" \
+    pics
+```
+
+Or equivalently:
+
+```shell
+export META_PASSWORD_FILE="/secret/mypassword.txt"
 juicefs format \
     --storage s3 \
     ... \
@@ -523,6 +570,13 @@ Passing password with the `META_PASSWORD` environment variable is also supported
 
 ```shell
 export META_PASSWORD="mypassword"
+juicefs mount -d "mysql://user@(192.168.1.6:3306)/juicefs" /mnt/jfs
+```
+
+Passing the password using a file is also supported as follows:
+
+```shell
+export META_PASSWORD_FILE="/secret/mypassword.txt"
 juicefs mount -d "mysql://user@(192.168.1.6:3306)/juicefs" /mnt/jfs
 ```
 
@@ -586,12 +640,23 @@ juicefs format \
     pics
 ```
 
+The password can also be passed using a file as follows:
+
+```shell
+export META_PASSWORD_FILE="/secret/mypassword.txt"
+juicefs format \
+    --storage s3 \
+    ... \
+    "postgres://user@192.168.1.6:5432/juicefs" \
+    pics
+```
+
 :::note
 
 1. JuiceFS uses public [schema](https://www.postgresql.org/docs/current/ddl-schemas.html) by default, if you want to use a `non-public schema`,  you need to specify `search_path` in the connection string parameter. e.g `postgres://user:mypassword@192.168.1.6:5432/juicefs?search_path=pguser1`
 2. If the `public schema` is not the first hit in the `search_path` configured on the PostgreSQL server, the `search_path` parameter must be explicitly set in the connection string.
 3. The `search_path` connection parameter can be set to multiple schemas natively, but currently JuiceFS only supports setting one. `postgres://user:mypassword@192.168.1.6:5432/juicefs?search_path=pguser1,public` will be considered illegal.
-4. Special characters in the password need to be replaced by url encoding. For example, `|` needs to be replaced with `%7C`.
+4. Special characters in the password need to be replaced by URL encoding. For example, `|` needs to be replaced with `%7C`.
 
 :::
 
@@ -605,6 +670,13 @@ Passing password with the `META_PASSWORD` environment variable is also supported
 
 ```shell
 export META_PASSWORD="mypassword"
+juicefs mount -d "postgres://user@192.168.1.6:5432/juicefs" /mnt/jfs
+```
+
+Passing a password using a file is also supported as follows:
+
+```shell
+export META_PASSWORD_FILE="/secret/mypassword.txt"
 juicefs mount -d "postgres://user@192.168.1.6:5432/juicefs" /mnt/jfs
 ```
 

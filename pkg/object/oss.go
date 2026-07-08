@@ -42,7 +42,7 @@ const ossDefaultRegionID = "cn-hangzhou"
 type ossClient struct {
 	client *oss.Client
 	bucket string
-	sc     string
+	tierStorage
 }
 
 func (o *ossClient) String() string {
@@ -53,17 +53,17 @@ func (o *ossClient) Limits() Limits {
 	return Limits{
 		IsSupportMultipartUpload: true,
 		IsSupportUploadPartCopy:  true,
-		MinPartSize:              int(oss.MinPartSize),
+		MinPartSize:              oss.MinPartSize,
 		MaxPartSize:              oss.MaxPartSize,
-		MaxPartCount:             int(oss.MaxUploadParts),
+		MaxPartCount:             int64(oss.MaxUploadParts),
 	}
 }
 
 func (o *ossClient) Create(ctx context.Context) error {
 	var configuration *oss.CreateBucketConfiguration
-	if o.sc != "" {
+	if o.tiers[0].Sc != "" {
 		configuration = &oss.CreateBucketConfiguration{
-			StorageClass: oss.StorageClassType(o.sc),
+			StorageClass: oss.StorageClassType(o.tiers[0].Sc),
 		}
 	}
 	_, err := o.client.PutBucket(ctx, &oss.PutBucketRequest{
@@ -94,6 +94,7 @@ func (o *ossClient) Head(ctx context.Context, key string) (Object, error) {
 		oss.ToTime(info.LastModified),
 		strings.HasSuffix(key, "/"),
 		oss.ToString(info.StorageClass),
+		oss.ToString(info.Restore),
 	}, nil
 }
 
@@ -131,11 +132,15 @@ func (o *ossClient) Get(ctx context.Context, key string, off, limit int64, gette
 }
 
 func (o *ossClient) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) error {
+	t := o.GetTier(ctx)
 	req := &oss.PutObjectRequest{
 		Bucket:       &o.bucket,
 		Key:          &key,
-		StorageClass: oss.StorageClassType(o.sc),
+		StorageClass: oss.StorageClassType(t.Sc),
 		Body:         in,
+	}
+	if t.encodedTag != "" {
+		req.Tagging = oss.Ptr(t.encodedTag)
 	}
 	if ins, ok := in.(io.ReadSeeker); ok {
 		req.Metadata = make(map[string]string)
@@ -152,17 +157,35 @@ func (o *ossClient) Put(ctx context.Context, key string, in io.Reader, getters .
 		reqId = result.Headers.Get(oss.HeaderOssRequestID)
 	}
 	attrs := ApplyGetters(getters...)
-	attrs.SetRequestID(reqId).SetStorageClass(o.sc)
+	attrs.SetRequestID(reqId).SetStorageClass(t.Sc)
+	return err
+}
+
+func (o *ossClient) Restore(ctx context.Context, key string, days int32) error {
+	_, err := o.client.RestoreObject(ctx, &oss.RestoreObjectRequest{
+		Bucket: oss.Ptr(o.bucket),
+		Key:    oss.Ptr(key),
+		RestoreRequest: &oss.RestoreRequest{
+			Days: days,
+			Tier: oss.Ptr("Standard"),
+		},
+	})
 	return err
 }
 
 func (o *ossClient) Copy(ctx context.Context, dst, src string) error {
+	t := o.GetTier(ctx)
+	sc := getOrDefaultScValue(t.Sc, string(oss.StorageClassStandard))
 	var req = &oss.CopyObjectRequest{
 		SourceBucket: &o.bucket,
 		Bucket:       &o.bucket,
 		SourceKey:    &src,
 		Key:          &dst,
-		StorageClass: oss.StorageClassType(o.sc),
+		StorageClass: oss.StorageClassType(sc),
+	}
+	if t.encodedTag != "" {
+		req.Tagging = oss.Ptr(t.encodedTag)
+		req.TaggingDirective = oss.Ptr("Replace")
 	}
 	_, err := o.client.CopyObject(ctx, req)
 	return err
@@ -191,14 +214,17 @@ func (o *ossClient) List(ctx context.Context, prefix, start, token, delimiter st
 	if limit > 1000 {
 		limit = 1000
 	}
-	result, err := o.client.ListObjectsV2(ctx, &oss.ListObjectsV2Request{
-		Bucket:            &o.bucket,
-		Prefix:            &prefix,
-		StartAfter:        &start,
-		ContinuationToken: &token,
-		Delimiter:         &delimiter,
-		MaxKeys:           int32(limit),
-	})
+	request := &oss.ListObjectsV2Request{
+		Bucket:     &o.bucket,
+		Prefix:     &prefix,
+		StartAfter: &start,
+		Delimiter:  &delimiter,
+		MaxKeys:    int32(limit),
+	}
+	if token != "" {
+		request.ContinuationToken = &token
+	}
+	result, err := o.client.ListObjectsV2(ctx, request)
 	if err != nil {
 		return nil, false, "", err
 	}
@@ -206,11 +232,11 @@ func (o *ossClient) List(ctx context.Context, prefix, start, token, delimiter st
 	objs := make([]Object, n)
 	for i := 0; i < n; i++ {
 		o := result.Contents[i]
-		objs[i] = &obj{oss.ToString(o.Key), o.Size, oss.ToTime(o.LastModified), strings.HasSuffix(oss.ToString(o.Key), "/"), oss.ToString(o.StorageClass)}
+		objs[i] = &obj{oss.ToString(o.Key), o.Size, oss.ToTime(o.LastModified), strings.HasSuffix(oss.ToString(o.Key), "/"), oss.ToString(o.StorageClass), ""}
 	}
 	if delimiter != "" {
 		for _, o := range result.CommonPrefixes {
-			objs = append(objs, &obj{oss.ToString(o.Prefix), 0, time.Unix(0, 0), true, ""})
+			objs = append(objs, &obj{oss.ToString(o.Prefix), 0, time.Unix(0, 0), true, "", ""})
 		}
 		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
 	}
@@ -225,7 +251,7 @@ func (o *ossClient) CreateMultipartUpload(ctx context.Context, key string) (*Mul
 	result, err := o.client.InitiateMultipartUpload(ctx, &oss.InitiateMultipartUploadRequest{
 		Bucket:       &o.bucket,
 		Key:          &key,
-		StorageClass: oss.StorageClassType(o.sc),
+		StorageClass: oss.StorageClassType(o.tiers[0].Sc),
 	})
 	if err != nil {
 		return nil, err
@@ -301,11 +327,6 @@ func (o *ossClient) ListUploads(ctx context.Context, marker string) ([]*PendingP
 		parts[i] = &PendingPart{oss.ToString(result.Key), oss.ToString(result.UploadId), oss.ToTime(u.LastModified)}
 	}
 	return parts, string(result.NextPartNumberMarker), nil
-}
-
-func (o *ossClient) SetStorageClass(sc string) error {
-	o.sc = sc
-	return nil
 }
 
 func autoOSSEndpoint(bucketName string, provider credentials.CredentialsProvider) (string, error) {
@@ -384,19 +405,41 @@ func newOSS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 		logger.Debugf("use endpoint %s", domain)
 	}
 	var regionID string
+	var useV4 bool
 	if regionID = os.Getenv("ALICLOUD_REGION_ID"); regionID == "" {
 		index := strings.Index(domain, ".")
 		if index <= 0 {
-			return nil, fmt.Errorf("invalid endpoint: %s", domain)
+			return nil, fmt.Errorf("invalid endpoint: %q", domain)
 		}
-		regionID = strings.TrimPrefix(strings.TrimPrefix(domain[:index], "http://"), "https://")
-		regionID = strings.TrimPrefix(regionID, "oss-")
-		regionID = strings.TrimSuffix(regionID, "-internal")
-		regionID = strings.TrimSuffix(regionID, "-vpc")
+		if strings.HasSuffix(domain, ".aliyuncs.com") {
+			if strings.Contains(domain, ".privatelink.") {
+				// <id>.oss.<region>.privatelink.aliyuncs.com
+				parts := strings.Split(domain, ".")
+				if len(parts) < 3 {
+					return nil, fmt.Errorf("invalid private link endpoint: %q", domain)
+				}
+				regionID = parts[2]
+				useV4 = true
+			} else {
+				// oss-<region>.aliyuncs.com
+				// oss-<region>-internal.aliyuncs.com
+				old := strings.TrimPrefix(strings.TrimPrefix(domain[:index], "http://"), "https://")
+				regionID = strings.TrimPrefix(old, "oss-")
+				regionID = strings.TrimSuffix(regionID, "-internal")
+				regionID = strings.TrimSuffix(regionID, "-vpc")
+				useV4 = old != regionID
+			}
+		}
 	}
 	config := oss.LoadDefaultConfig()
 	config.Endpoint = oss.Ptr(domain)
-	config.Region = oss.Ptr(regionID)
+	if useV4 {
+		config.WithSignatureVersion(oss.SignatureVersionV4)
+		config.Region = oss.Ptr(regionID)
+	} else {
+		config.WithSignatureVersion(oss.SignatureVersionV1)
+	}
+	config.UsePathStyle = oss.Ptr(strings.Contains(domain, ".privatelink."))
 	config.RetryMaxAttempts = oss.Ptr(1)
 	config.ConnectTimeout = oss.Ptr(time.Second * 2)
 	config.ReadWriteTimeout = oss.Ptr(time.Second * 5)

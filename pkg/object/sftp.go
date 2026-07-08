@@ -11,7 +11,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -199,7 +198,8 @@ func (f *sftpStore) Get(ctx context.Context, key string, off, limit int64, gette
 	if err != nil {
 		return nil, err
 	}
-	if finfo.IsDir() {
+	if finfo.IsDir() || off >= finfo.Size() {
+		_ = ff.Close()
 		return io.NopCloser(bytes.NewBuffer([]byte{})), nil
 	}
 
@@ -235,7 +235,7 @@ func (f *sftpStore) Put(ctx context.Context, key string, in io.Reader, getters .
 		if len(name) > 200 {
 			name = name[:200]
 		}
-		tmp = path.Join(path.Dir(p), fmt.Sprintf(".%s.tmp.%d", name, rand.Int()))
+		tmp = TmpFilePath(p, name)
 		defer func() {
 			if err != nil {
 				_ = c.sftpClient.Remove(tmp)
@@ -339,26 +339,33 @@ func (f *sftpStore) Delete(ctx context.Context, key string, getters ...AttrGette
 }
 
 func (f *sftpStore) sortByName(c *sftp.Client, path string, fis []os.FileInfo, followLink bool) []*mEntry {
-	mEntries := make([]*mEntry, len(fis))
-	for i, e := range fis {
+	mEntries := make([]*mEntry, 0, len(fis))
+	for _, e := range fis {
 		isSymlink := e.Mode()&os.ModeSymlink != 0
 		if e.IsDir() {
-			mEntries[i] = &mEntry{e, e.Name() + dirSuffix, nil, false}
+			mEntries = append(mEntries, &mEntry{e, e.Name() + dirSuffix, nil, false})
 		} else if isSymlink && followLink {
 			var fi os.FileInfo
 			p := path + e.Name()
 			fi, err := c.Stat(p)
 			if err != nil {
-				mEntries[i] = &mEntry{e, e.Name(), nil, true}
+				mEntries = append(mEntries, &mEntry{e, e.Name(), nil, true})
 				continue
 			}
 			name := e.Name()
 			if fi.IsDir() {
 				name = e.Name() + dirSuffix
+			} else if !fi.Mode().IsRegular() {
+				logger.Warnf("%s is not a regular file, ignore it", name)
+				continue
 			}
-			mEntries[i] = &mEntry{e, name, fi, false}
+			mEntries = append(mEntries, &mEntry{e, name, fi, false})
 		} else {
-			mEntries[i] = &mEntry{e, e.Name(), nil, isSymlink}
+			if !isSymlink && !e.Mode().IsRegular() {
+				logger.Warnf("%s is not a regular file, ignore it", e.Name())
+				continue
+			}
+			mEntries = append(mEntries, &mEntry{e, e.Name(), nil, isSymlink})
 		}
 	}
 	sort.Slice(mEntries, func(i, j int) bool { return mEntries[i].Name() < mEntries[j].Name() })
@@ -368,7 +375,7 @@ func (f *sftpStore) sortByName(c *sftp.Client, path string, fis []os.FileInfo, f
 func (f *sftpStore) fileInfo(key string, fi os.FileInfo, isSymlink bool) Object {
 	owner, group := getOwnerGroup(fi)
 	ff := &file{
-		obj{key, fi.Size(), fi.ModTime(), fi.IsDir(), ""},
+		obj{key, fi.Size(), fi.ModTime(), fi.IsDir(), "", ""},
 		owner,
 		group,
 		fi.Mode(),
@@ -488,7 +495,7 @@ func newSftp(endpoint, username, pass, token string) (ObjectStorage, error) {
 	}
 	root := filepath.Clean(endpoint[idx+1:])
 	if runtime.GOOS == "windows" {
-		root = strings.Replace(root, "\\", "/", -1)
+		root = strings.ReplaceAll(root, "\\", "/")
 	}
 	// append suffix `/` removed by filepath.Clean()
 	if strings.HasSuffix(endpoint[idx+1:], dirSuffix) {

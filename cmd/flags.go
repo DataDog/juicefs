@@ -80,6 +80,8 @@ func addCategory(f cli.Flag, cat string) {
 		ff.Category = cat
 	case *cli.Float64Flag:
 		ff.Category = cat
+	case *cli.DurationFlag:
+		ff.Category = cat
 	case *cli.StringSliceFlag:
 		ff.Category = cat
 	default:
@@ -109,6 +111,10 @@ func storageFlags() []cli.Flag {
 			Usage: "the storage class for data written by current client",
 		},
 		&cli.StringFlag{
+			Name:  "tag",
+			Usage: "custom tag when uploading object storage (e.g. --tag key=value)",
+		},
+		&cli.StringFlag{
 			Name:  "get-timeout",
 			Value: "60s",
 			Usage: "the timeout to download an object",
@@ -127,6 +133,11 @@ func storageFlags() []cli.Flag {
 			Name:  "max-uploads",
 			Value: 20,
 			Usage: "number of connections to upload",
+		},
+		&cli.IntFlag{
+			Name:  "max-downloads",
+			Value: 200,
+			Usage: "number of connections to download",
 		},
 		&cli.IntFlag{
 			Name:  "max-stage-write",
@@ -154,7 +165,7 @@ func storageFlags() []cli.Flag {
 	})
 }
 
-func dataCacheFlags() []cli.Flag {
+func getDefaultCacheDir() string {
 	var defaultCacheDir = "/var/jfsCache"
 	switch runtime.GOOS {
 	case "linux":
@@ -165,7 +176,7 @@ func dataCacheFlags() []cli.Flag {
 	case "darwin":
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
-			logger.Warn(err)
+			logger.Warnf("%v", err)
 			homeDir = defaultCacheDir
 		}
 		defaultCacheDir = path.Join(homeDir, ".juicefs", "cache")
@@ -173,10 +184,15 @@ func dataCacheFlags() []cli.Flag {
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
 			logger.Fatalf("%v", err)
-			return nil
+			return ""
 		}
 		defaultCacheDir = path.Join(homeDir, ".juicefs", "cache")
 	}
+	return defaultCacheDir
+}
+
+func dataCacheFlags() []cli.Flag {
+	var defaultCacheDir = getDefaultCacheDir()
 	return addCategories("DATA CACHE", []cli.Flag{
 		&cli.StringFlag{
 			Name:  "buffer-size",
@@ -195,6 +211,11 @@ func dataCacheFlags() []cli.Flag {
 		&cli.BoolFlag{
 			Name:  "writeback",
 			Usage: "upload blocks in background",
+		},
+		&cli.StringFlag{
+			Name:  "writeback-threshold-size",
+			Value: "0",
+			Usage: "blocks smaller than this size will be staged, 0 means all staged.",
 		},
 		&cli.StringFlag{
 			Name:  "upload-delay",

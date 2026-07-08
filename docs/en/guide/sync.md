@@ -135,6 +135,10 @@ One solution is to include all directories in the directory hierarchy by using t
 
 You can sync data between any [supported storage system](../reference/how_to_set_up_object_storage.md), but note that if one of the endpoint is a JuiceFS volume, it it then recommended to [sync without mount point](#sync-without-mount-point) since it runs without FUSE overhead.
 
+:::note Paths containing special characters
+`juicefs sync` interprets both source and destination paths as URLs. Therefore, if a path contains characters with special meanings in URLs (such as `#`), they must be escaped (URL-encoded) before use. Otherwise, the path may be truncated or parsed incorrectly. For example, `#` must be written as `%23`, so the path `a/b#c/d` should be written as `a/b%23c/d`.
+:::
+
 ### Sync without mount point <VersionAdd>1.1</VersionAdd> {#sync-without-mount-point}
 
 For data migrations that involve JuiceFS, it's recommended use the `jfs://` protocol, rather than mount JuiceFS and access its local directory, which bypasses the FUSE mount point and access JuiceFS directly. Under large scale scenarios, bypassing FUSE can save precious resources and increase performance.
@@ -196,6 +200,28 @@ When using the SFTP/SSH protocol, if no password is specified, the sync task wil
 By default, `juicefs sync` performs incremental synchronization. It only overwrites files if their sizes are different. You can also use [`--update`](../reference/command_reference.mdx#sync) to overwrite files when the `mtime` of the source file has been updated. For scenarios with higher demand for data integrity, use [`--check-new`](../reference/command_reference.mdx#sync) or [`--check-all`](../reference/command_reference.mdx#sync) to perform byte-by-byte comparison between the source and the destination.
 
 For full synchronization (where all files are synchronized regardless of their presence on the destination path), use [`--force-update`](../reference/command_reference.mdx#sync).
+
+### Resumable sync with checkpoint {#checkpoint}
+
+For long-running sync jobs, use `--enable-checkpoint` to save progress to the destination storage. This allows an interrupted job to resume from the latest checkpoint:
+
+```shell
+juicefs sync --enable-checkpoint SRC DST
+```
+
+When you restart the same sync command with `--enable-checkpoint`, JuiceFS automatically loads the checkpoint whose source, destination, and sync options match the current run. The checkpoint records listed prefixes, pending and failed objects, delayed deletes, and progress statistics. By default, the checkpoint is saved every 10 seconds. You can adjust the interval using `--checkpoint-interval`:
+
+```shell
+juicefs sync --enable-checkpoint --checkpoint-interval 30s SRC DST
+```
+
+The checkpoint file is stored in the destination storage as a hidden object with a name like `.juicefs-sync-checkpoint.<hash>.json`. JuiceFS deletes it after the sync job completes successfully. If the process is interrupted, restarted, or exits with failed objects, the checkpoint is retained for the next run.
+
+To ignore an existing checkpoint and start from scratch, use `--checkpoint-force-reset`:
+
+```shell
+juicefs sync --enable-checkpoint --checkpoint-force-reset SRC DST
+```
 
 ### Directory structure and file permissions {#directory-structure-and-file-permissions}
 
@@ -297,6 +323,93 @@ parallel-ssh -h hosts.txt -i juicefs mount -d redis://10.10.0.8:6379/1 /jfs-dst 
 juicefs sync --worker host1,host2 /jfs-src /jfs-dst
 ```
 
+### Global traffic control {#global-traffic-control}
+
+`--bwlimit` applies only to a single `juicefs sync` process. When multiple sync processes run concurrently (for example, when using [distributed synchronization](#distributed-sync)), each process enforces its own bandwidth limit independently, so the aggregate bandwidth of all processes may greatly exceed the expected limit.
+
+`--traffic-control-url` solves this by pointing all sync processes to the same centralized traffic-control HTTP server that acts as a shared token-bucket. All processes request bandwidth tokens from the server before transferring data, ensuring that the total throughput across all running instances never exceeds the server-configured rate.
+
+### HTTP API protocol
+
+The sync client and your traffic-control server communicate via a simple JSON-over-HTTP protocol:
+
+| Direction | Method | Path | Body | Description |
+|-----------|--------|------|------|-------------|
+| Request tokens | POST | `<url>` | `{"bytes": N}` | Ask for N bytes of bandwidth. N > 0. |
+| Return unused tokens | POST | `<url>` | `{"bytes": -N}` | Return N bytes of unused tokens to the server. N < 0. |
+
+**Response** (JSON):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `granted` | int64 | Number of bytes actually granted (equal to the requested amount for a blocking server). |
+| `expired` | int64 | Token validity in **milliseconds**. The client returns unused tokens before this expiration. |
+
+The client blocks on the POST request until the server responds, so the server's internal token bucket (or any other rate-limiting logic) is what enforces the global limit.
+
+### Reference server implementation
+
+The following is a minimal Go server that implements a global bandwidth limit with an average rate of 3 MB/s and a burst capacity of 10 MB using [`github.com/juju/ratelimit`](https://github.com/juju/ratelimit):
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "io"
+    "log"
+    "net/http"
+
+    "github.com/juju/ratelimit"
+)
+
+var limiter *ratelimit.Bucket
+
+type req struct {
+    // Positive: request tokens. Negative: return unused tokens.
+    Bytes int64 `json:"bytes"`
+}
+type resp struct {
+    Granted int64 `json:"granted"` // bytes granted
+    Expired int64 `json:"expired"` // token validity in milliseconds
+}
+
+func tokenHandler(w http.ResponseWriter, r *http.Request) {
+    body, _ := io.ReadAll(r.Body)
+    var in req
+    json.Unmarshal(body, &in)
+    if in.Bytes > 0 {
+        limiter.Wait(in.Bytes) // blocks until tokens are available
+    }
+    out, _ := json.Marshal(resp{Granted: in.Bytes, Expired: 1000})
+    w.Header().Set("Content-Type", "application/json")
+    w.Write(out)
+}
+
+func main() {
+    // 3 MB/s average rate, 10 MB burst
+    limiter = ratelimit.NewBucketWithRate(3<<20, 10<<20)
+    http.HandleFunc("/token", tokenHandler)
+    fmt.Println("Starting traffic control server on :8080")
+    log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+### Usage
+
+Start the server on a host reachable by all sync processes, and then pass its token endpoint to each `juicefs sync` call:
+
+```shell
+# Run the traffic control server (once, on any accessible host)
+go run traffic_control_server.go
+
+# Each sync process uses the same URL to share a global bandwidth cap
+juicefs sync --traffic-control-url http://10.0.0.1:8080/token s3://src/ s3://dst/
+```
+
+`--bwlimit` and `--traffic-control-url` can be used together: `--bwlimit` sets a limit for each individual process, while `--traffic-control-url` enforces a global limit across all processes.
+
 ## Observation {#observation}
 
 When using `sync` to transfer large files, the progress bar might move slowly or get stuck. If this happens, you can observe the progress using other methods.
@@ -312,7 +425,7 @@ If you notice the progress bar is not changing, use the methods below for monito
   * Use [`juicefs stats`](../administration/fault_diagnosis_and_analysis.md#stats) to quickly check current I/O status.
   * Review the [client log](../administration/fault_diagnosis_and_analysis.md#client-log) (default path: `/var/log/juicefs.log`) for [slow requests or timeout errors](../administration/troubleshooting.md#io-error-object-storage).
 
-* If the destination is a local disk, check the directory for temporary files with `.tmp.xxx`. During the synchronization process, the transfer results are written to these temporary files. Once the transfer is complete, they are renamed to finalize the write. By monitoring the size changes of the temporary files, you can determine the current I/O status.
+* If the destination is a local disk, check the directory for temporary files with `.jfs.xxx.tmp.xxx`. During the synchronization process, the transfer results are written to these temporary files. Once the transfer is complete, they are renamed to finalize the write. By monitoring the size changes of the temporary files, you can determine the current I/O status.
 
 * If both the source and destination are object storage systems, use tools like `nethogs` to check network I/O.
 
@@ -361,3 +474,81 @@ JuiceFS S3 Gateway is the solution in these scenarios: by deploying a gateway in
 ![sync via gateway](../images/sync-via-gateway.svg)
 
 Read [S3 Gateway](../guide/gateway.md) to learn its deployment and use.
+
+## Encryption and decryption {#encryption-and-decryption}
+
+`juicefs sync` supports end-to-end encryption and decryption during synchronization. You can encrypt plaintext data before writing to the destination, decrypt encrypted data from the source, or perform re-encryption between different keys/algorithms.
+
+It works by processing each file in 1 MiB chunks. Every chunk starts with a 4-byte header that records ciphertext length, followed by the encrypted data. This design enables random reads without downloading an entire file. The trade-off is that objects on the destination appear larger than the original plaintext and are not human-readable. `--check-all` and `--check-new` can still be used, but with additional overhead.
+
+### Encryption algorithms {#encryption-algorithms}
+
+The following encryption algorithms are supported:
+
+| Algorithm | Description |
+| ---- | ---- |
+| `aes256gcm-rsa` | AES-256-GCM symmetric encryption with RSA key encryption (default) |
+| `chacha20-rsa` | ChaCha20-Poly1305 symmetric encryption with RSA key encryption |
+| `sm4gcm` | SM4-GCM symmetric encryption with SM2 key encryption |
+
+### Generate key pair {#generate-key-pair}
+
+Use OpenSSL to generate an RSA private key (the public key is embedded in the private key file and extracted automatically by JuiceFS):
+
+```shell
+openssl genrsa -out private.pem 2048
+```
+
+For password-protected private keys:
+
+```shell
+openssl genrsa -aes256 -out private.pem 2048
+```
+
+### Encrypt destination {#encrypt-destination}
+
+Synchronize plaintext data to an encrypted destination:
+
+```shell
+juicefs sync /local/data s3://mybucket/backup \
+    --encrypt-rsa-key /path/to/private.pem \
+    --encrypt-algo aes256gcm-rsa
+```
+
+### Decrypt source {#decrypt-source}
+
+Synchronize encrypted data to a plaintext destination:
+
+```shell
+juicefs sync s3://mybucket/backup /local/data \
+    --decrypt-rsa-key /path/to/private.pem \
+    --decrypt-algo aes256gcm-rsa
+```
+
+### Re-encrypt data {#re-encrypt-data}
+
+Synchronize encrypted data from one storage to another, optionally changing the encryption algorithm or key:
+
+```shell
+juicefs sync s3://old-bucket/encrypted s3://new-bucket/re-encrypted \
+    --decrypt-rsa-key /path/to/old-private.pem \
+    --decrypt-algo aes256gcm-rsa \
+    --encrypt-rsa-key /path/to/new-private.pem \
+    --encrypt-algo aes256gcm-rsa
+```
+
+### Password-protected keys {#password-protected-keys}
+
+If the private key is password-protected, set the corresponding environment variable before running the command:
+
+- Use `JFS_ENCRYPT_RSA_PASSPHRASE` when specifying `--encrypt-rsa-key`
+- Use `JFS_DECRYPT_RSA_PASSPHRASE` when specifying `--decrypt-rsa-key`
+
+For example, to encrypt a destination with a password-protected key:
+
+```shell
+export JFS_ENCRYPT_RSA_PASSPHRASE="your-password"
+
+juicefs sync /local/data s3://mybucket/backup \
+    --encrypt-rsa-key /path/to/encrypted-private.pem
+```

@@ -19,6 +19,7 @@ package cmd
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -65,6 +66,11 @@ $ juicefs fsck redis://localhost --path /d1/d2 --recursive`,
 				Name:  "sync-dir-stat",
 				Usage: "sync stat of all directories, even if they are existed and not broken (NOTE: it may take a long time for huge trees)",
 			},
+			&cli.StringFlag{
+				Name:  "repair-dir-mode",
+				Value: "0755",
+				Usage: "permission mode for repaired directories (octal, e.g., 0755)",
+			},
 		},
 	}
 }
@@ -81,12 +87,37 @@ func fsck(ctx *cli.Context) error {
 		logger.Fatalf("load setting: %s", err)
 	}
 	var c = meta.NewContext(0, 0, []uint32{0})
-	if p := ctx.String("path"); p != "" {
-		if !strings.HasPrefix(p, "/") {
-			logger.Fatalf("File path should be the absolute path within JuiceFS")
-		}
-		return m.Check(c, p, ctx.Bool("repair"), ctx.Bool("recursive"), ctx.Bool("sync-dir-stat"))
+	progress := utils.NewProgress(false)
+	// prepare slices
+	sliceCSpin := progress.AddCountSpinner("Listed slices")
+	slices := make(map[meta.Ino][]meta.Slice)
+	path := ctx.String("path")
+	repairDirMode, err := strconv.ParseUint(ctx.String("repair-dir-mode"), 8, 16) // base 8 (octal), 16-bit result
+	if err != nil {
+		logger.Fatalf("invalid repair-dir-mode %q: %s", ctx.String("repair-dir-mode"), err)
 	}
+	if path != "" {
+		if !strings.HasPrefix(path, "/") {
+			logger.Fatalf("file path %q should be the absolute path within JuiceFS", path)
+		}
+		err := m.Check(c, path, &meta.CheckOpt{
+			Repair:        ctx.Bool("repair"),
+			Recursive:     ctx.Bool("recursive"),
+			SyncDirStat:   ctx.Bool("sync-dir-stat"),
+			RepairDirMode: uint16(repairDirMode),
+			ShowProgress:  sliceCSpin.IncrBy,
+			Slices:        slices,
+		})
+		if err != nil {
+			logger.Fatalf("check: %s", err)
+		}
+	} else {
+		r := m.ListSlices(c, slices, false, false, sliceCSpin.Increment)
+		if r != 0 {
+			logger.Fatalf("list all slices: %s", r)
+		}
+	}
+	sliceCSpin.Done()
 
 	chunkConf := *getDefaultChunkConf(format)
 	chunkConf.CacheDir = "memory"
@@ -97,59 +128,44 @@ func fsck(ctx *cli.Context) error {
 	}
 	logger.Infof("Data use %s", blob)
 	blob = object.WithPrefix(blob, "chunks/")
-	objs, err := object.ListAll(ctx.Context, blob, "", "", true, false)
-	if err != nil {
-		logger.Fatalf("list all blocks: %s", err)
-	}
 
 	// Find all blocks in object storage
-	progress := utils.NewProgress(false)
 	blockDSpin := progress.AddDoubleSpinner("Found blocks")
 	var blocks = make(map[string]int64)
-	for obj := range objs {
-		if obj == nil {
-			break // failed listing
+	if path == "" {
+		objs, err := object.ListAll(ctx.Context, blob, "", "", true, false)
+		if err != nil {
+			logger.Fatalf("list all blocks: %s", err)
 		}
-		if obj.IsDir() {
-			continue
-		}
+		for obj := range objs {
+			if obj == nil {
+				break // failed listing
+			}
+			if obj.IsDir() {
+				continue
+			}
 
-		logger.Debugf("found block %s", obj.Key())
-		parts := strings.Split(obj.Key(), "/")
-		if len(parts) != 3 {
-			continue
+			logger.Debugf("found block %s", obj.Key())
+			parts := strings.Split(obj.Key(), "/")
+			if len(parts) != 3 {
+				continue
+			}
+			name := parts[2]
+			blocks[name] = obj.Size()
+			blockDSpin.IncrInt64(obj.Size())
 		}
-		name := parts[2]
-		blocks[name] = obj.Size()
-		blockDSpin.IncrInt64(obj.Size())
+		blockDSpin.Done()
 	}
-	blockDSpin.Done()
-	if progress.Quiet {
-		c, b := blockDSpin.Current()
-		logger.Infof("Found %d blocks (%d bytes)", c, b)
-	}
-
-	// List all slices in metadata engine
-	sliceCSpin := progress.AddCountSpinner("Listed slices")
-	slices := make(map[meta.Ino][]meta.Slice)
-	r := m.ListSlices(c, slices, false, false, sliceCSpin.Increment)
-	if r != 0 {
-		logger.Fatalf("list all slices: %s", r)
-	}
-	sliceCSpin.Done()
-	delfilesSpin := progress.AddCountSpinner("Deleted files")
 	delfiles := make(map[meta.Ino]bool)
 	err = m.ScanDeletedObject(c, nil, nil, nil, func(ino meta.Ino, size uint64, ts int64) (clean bool, err error) {
-		delfilesSpin.Increment()
 		delfiles[ino] = true
 		return false, nil
 	})
 	if err != nil {
 		logger.Warnf("scan deleted objects: %s", err)
 	}
-	delfilesSpin.Done()
-
 	// Scan all slices to find lost blocks
+	delfilesSpin := progress.AddCountSpinner("Deleted files")
 	skippedSlices := progress.AddCountSpinner("Skipped slices")
 	sliceCBar := progress.AddCountBar("Scanned slices", sliceCSpin.Current())
 	sliceBSpin := progress.AddByteSpinner("Scanned slices")
@@ -157,6 +173,7 @@ func fsck(ctx *cli.Context) error {
 	brokens := make(map[meta.Ino]string)
 	for inode, ss := range slices {
 		if delfiles[inode] {
+			delfilesSpin.Increment()
 			skippedSlices.IncrBy(len(ss))
 			continue
 		}
@@ -175,7 +192,8 @@ func fsck(ctx *cli.Context) error {
 					} else {
 						objKey = fmt.Sprintf("%v/%v/%s", s.Id/1000/1000, s.Id/1000, key)
 					}
-					if _, err := blob.Head(ctx.Context, objKey); err != nil {
+					obj, err := blob.Head(ctx.Context, objKey)
+					if err != nil {
 						if _, ok := brokens[inode]; !ok {
 							if ps := m.GetPaths(meta.Background(), inode); len(ps) > 0 {
 								brokens[inode] = ps[0]
@@ -185,7 +203,9 @@ func fsck(ctx *cli.Context) error {
 						}
 						logger.Errorf("can't find block %s for file %s: %s", objKey, brokens[inode], err)
 						lostDSpin.IncrInt64(int64(sz))
+						continue
 					}
+					blockDSpin.IncrInt64(obj.Size())
 				}
 			}
 			sliceCBar.Increment()
@@ -194,6 +214,8 @@ func fsck(ctx *cli.Context) error {
 	}
 	progress.Done()
 	if progress.Quiet {
+		c, b := blockDSpin.Current()
+		logger.Infof("Found %d blocks (%d bytes)", c, b)
 		logger.Infof("Used by %d slices (%d bytes)", sliceCBar.Current(), sliceBSpin.Current())
 	}
 	if lc, lb := lostDSpin.Current(); lc > 0 {

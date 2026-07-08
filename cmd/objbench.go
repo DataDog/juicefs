@@ -166,7 +166,7 @@ func objbench(ctx *cli.Context) error {
 		}
 		var err error
 		if endpoint, err = filepath.Abs(endpoint); err != nil {
-			logger.Fatalf("invalid path: %s", err)
+			logger.Fatalf("invalid path %q: %s", endpoint, err)
 		}
 	}
 	var blobOrigin object.ObjectStorage
@@ -184,9 +184,10 @@ func objbench(ctx *cli.Context) error {
 	prefix := fmt.Sprintf("__juicefs_benchmark_%d__/", time.Now().UnixNano())
 	blob := object.WithPrefix(blobOrigin, prefix)
 	storageClass := ctx.String("storage-class")
-	if os, ok := blob.(object.SupportStorageClass); ok && storageClass != "" {
-		if err := os.SetStorageClass(storageClass); err != nil {
-			logger.Fatalf("set storageClass %s failed: %v", storageClass, err)
+	if os, ok := blob.(object.SupportTier); ok && storageClass != "" {
+		tiers := object.NewTiers(storageClass)
+		if err := os.InitTiers(tiers); err != nil {
+			logger.Warnf("Set storage tier: %s", err)
 		}
 	}
 	defer func() {
@@ -478,7 +479,7 @@ type benchMarkObj struct {
 
 func (bm *benchMarkObj) run(ctx context.Context, api apiInfo) []string {
 	if api.name == "chown" || api.name == "chmod" || api.name == "chtimes" {
-		if err := bm.chmod(ctx, "not_exists", 0); err == utils.ENOTSUP {
+		if err := bm.chmod(ctx, "not_exists", 0); err == utils.ErrNotSUP {
 			line := api.getResult(-1)
 			line[0] = api.title
 			return line
@@ -694,7 +695,7 @@ var syncTests = map[string]bool{
 func functionalTesting(ctx context.Context, blob object.ObjectStorage, result *[][]string, colorful bool) {
 	runCase := func(title string, fn func(blob object.ObjectStorage) error) {
 		r := pass
-		if err := fn(blob); err == utils.ENOTSUP {
+		if err := fn(blob); err == utils.ErrNotSUP {
 			r = nspt
 		} else if err != nil {
 			color := RED
@@ -725,7 +726,7 @@ func functionalTesting(ctx context.Context, blob object.ObjectStorage, result *[
 	isFileSystem := true
 	fi, ok := blob.(object.FileSystem)
 	if ok {
-		if err := fi.Chmod("not_exists_file", 0755); err == utils.ENOTSUP {
+		if err := fi.Chmod("not_exists_file", 0755); err == utils.ErrNotSUP {
 			isFileSystem = false
 		}
 	}
@@ -747,7 +748,7 @@ func functionalTesting(ctx context.Context, blob object.ObjectStorage, result *[
 	funFSCase := func(name string, fn func() error) {
 		runCase(name, func(blob object.ObjectStorage) error {
 			if !isFileSystem {
-				return utils.ENOTSUP
+				return utils.ErrNotSUP
 			}
 			br := []byte("hello")
 			if err := blob.Put(ctx, key, bytes.NewReader(br)); err != nil {
@@ -908,7 +909,7 @@ func functionalTesting(ctx context.Context, blob object.ObjectStorage, result *[
 				}
 				now := time.Now()
 				if objs[1].Mtime().Before(now.Add(-30*time.Second)) || objs[1].Mtime().After(now.Add(time.Second*30)) {
-					return fmt.Errorf("mtime of key should be within 10 seconds, but got %s", objs[1].Mtime().Sub(now))
+					return fmt.Errorf("mtime of key should be within 30 seconds, but got %s", objs[1].Mtime().Sub(now))
 				}
 			} else {
 				return fmt.Errorf("list failed: %s", err)
@@ -934,7 +935,7 @@ func functionalTesting(ctx context.Context, blob object.ObjectStorage, result *[
 				}
 				now := time.Now()
 				if objs[0].Mtime().Before(now.Add(-30*time.Second)) || objs[0].Mtime().After(now.Add(time.Second*30)) {
-					return fmt.Errorf("mtime of key should be within 10 seconds, but got %s", objs[0].Mtime().Sub(now))
+					return fmt.Errorf("mtime of key should be within 30 seconds, but got %s", objs[0].Mtime().Sub(now))
 				}
 			} else {
 				return fmt.Errorf("list failed: %s", err2)
@@ -981,7 +982,7 @@ func functionalTesting(ctx context.Context, blob object.ObjectStorage, result *[
 		if err := blob.Put(ctx, key, bytes.NewReader([]byte("1"))); err != nil {
 			return fmt.Errorf("put encode file failed: %s", err)
 		} else {
-			if resp, _, _, err := blob.List(ctx, "", "测试编码文件", "", "", 1, true); err != nil && err != utils.ENOTSUP {
+			if resp, _, _, err := blob.List(ctx, "", "测试编码文件", "", "", 1, true); err != nil && err != utils.ErrNotSUP {
 				return fmt.Errorf("list encode file failed %s", err)
 			} else if len(resp) == 1 && resp[0].Key() != key {
 				return fmt.Errorf("list encode file failed: expect key %s, but got %s", key, resp[0].Key())
@@ -1028,7 +1029,7 @@ func functionalTesting(ctx context.Context, blob object.ObjectStorage, result *[
 		}()
 
 		key := "multi_test_file"
-		if err = blob.CompleteUpload(ctx, key, "notExistsUploadId", []*object.Part{}); err != utils.ENOTSUP {
+		if err = blob.CompleteUpload(ctx, key, "notExistsUploadId", []*object.Part{}); err != utils.ErrNotSUP {
 			defer blob.Delete(ctx, key) //nolint:errcheck
 			upload, err := blob.CreateMultipartUpload(ctx, key)
 			if err != nil {
@@ -1090,7 +1091,7 @@ func functionalTesting(ctx context.Context, blob object.ObjectStorage, result *[
 			}
 			return nil
 		}
-		return utils.ENOTSUP
+		return utils.ErrNotSUP
 	})
 
 	funFSCase("change owner/group", func() error {

@@ -25,6 +25,7 @@ import (
 	"os"
 	"path"
 	"runtime/trace"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -139,6 +140,9 @@ type FileSystem struct {
 	store       chunk.ChunkStore
 	cacheFiller *vfs.CacheFiller
 
+	Superuser  string
+	Supergroup string
+
 	cacheM          sync.Mutex
 	entries         map[Ino]map[string]*entryCache
 	attrs           map[Ino]*attrCache
@@ -151,6 +155,9 @@ type FileSystem struct {
 	opsDurationsHistogram prometheus.Histogram
 
 	registry *prometheus.Registry
+
+	// Pre-parsed subdir prefixes for fast path checking
+	subdirPrefixes []string
 }
 
 type File struct {
@@ -199,6 +206,18 @@ func NewFileSystem(conf *vfs.Config, m meta.Meta, d chunk.ChunkStore, registry *
 			Buckets: prometheus.ExponentialBuckets(0.00001, 1.8, 29),
 		}),
 		registry: registry,
+	}
+
+	// Pre-parse subdir prefixes for fast path checking
+	if conf.Subdir != "" {
+		subdirs := strings.Split(conf.Subdir, ",")
+		fs.subdirPrefixes = make([]string, 0, len(subdirs))
+		for _, prefix := range subdirs {
+			prefix = strings.TrimSpace(prefix)
+			if prefix != "" {
+				fs.subdirPrefixes = append(fs.subdirPrefixes, prefix)
+			}
+		}
 	}
 
 	go fs.cleanupCache()
@@ -298,13 +317,24 @@ func (fs *FileSystem) log(ctx LogContext, format string, args ...interface{}) {
 func (fs *FileSystem) flushLog(f *os.File, logBuffer chan string, path string) {
 	buf := make([]byte, 0, 128<<10)
 	var lastcheck = time.Now()
+	defer func() {
+		if f != nil {
+			_ = f.Close()
+		}
+	}()
 	for {
-		line := <-logBuffer
+		line, ok := <-logBuffer
+		if !ok {
+			return
+		}
 		buf = append(buf[:0], []byte(line)...)
 	LOOP:
 		for len(buf) < (128 << 10) {
 			select {
-			case line = <-logBuffer:
+			case line, ok = <-logBuffer:
+				if !ok {
+					break LOOP
+				}
 				buf = append(buf, []byte(line)...)
 			default:
 				break LOOP
@@ -513,6 +543,40 @@ func (fs *FileSystem) Delete(ctx meta.Context, p string) (err syscall.Errno) {
 	l := vfs.NewLogContext(ctx)
 	defer func() { fs.log(l, "Delete (%s): %s", p, errstr(err)) }()
 	return fs.Delete0(ctx, p, false)
+}
+
+func (fs *FileSystem) BatchDeleteEntries(ctx meta.Context, parent string, ps []string) (err syscall.Errno) {
+	defer trace.StartRegion(context.TODO(), "fs.BatchDeleteEntries").End()
+	l := vfs.NewLogContext(ctx)
+	defer func() { fs.log(l, "BatchDeleteEntries : %s", errstr(err)) }()
+	parentInfo, errno := fs.Stat(ctx, parent)
+	if errno != 0 {
+		return errno
+	}
+	if errno = fs.m.Access(ctx, parentInfo.inode, meta.MODE_MASK_W|meta.MODE_MASK_X, parentInfo.attr); errno != 0 {
+		return errno
+	}
+	var entries []*meta.Entry
+	for _, p := range ps {
+		var inode Ino
+		var attr meta.Attr
+		name := path.Base(p)
+		if err = fs.lookup(ctx, parentInfo.inode, name, &inode, &attr); err != 0 {
+			if err == syscall.ENOENT {
+				continue
+			}
+			return
+		}
+		entries = append(entries, &meta.Entry{Inode: inode, Name: []byte(name), Attr: &attr})
+	}
+	if len(entries) == 0 {
+		return 0
+	}
+	eno := fs.m.BatchUnlink(ctx, parentInfo.inode, entries, nil, false)
+	for _, p := range ps {
+		fs.InvalidateEntry(parentInfo.inode, path.Base(p))
+	}
+	return eno
 }
 
 func (fs *FileSystem) Delete0(ctx meta.Context, p string, callByUnlink bool) (err syscall.Errno) {
@@ -855,16 +919,34 @@ func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool
 }
 
 func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bool, visited map[Ino]struct{}) (fi *FileStat, err syscall.Errno) {
-	prefix := fs.conf.Subdir
 	p = path.Clean(p)
-	if !strings.HasPrefix(p, prefix) || len(prefix) > 0 && len(p) > len(prefix) && p[len(prefix)] != '/' {
-		return nil, syscall.EACCES
+
+	// Check if path is allowed by any of the configured subdirs
+	if len(fs.subdirPrefixes) > 0 {
+		allowed := false
+		plen := len(p)
+		for _, prefix := range fs.subdirPrefixes {
+			prefixLen := len(prefix)
+			// Fast path: check length first to avoid string comparison if possible
+			if prefixLen > plen {
+				continue
+			}
+			// Check if path starts with prefix and is either the prefix itself or has '/' after prefix
+			// This prevents matching "/test" with "/testfile" (should match "/test" or "/test/...")
+			if strings.HasPrefix(p, prefix) && (prefixLen == plen || p[prefixLen] == '/') {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return nil, syscall.EACCES
+		}
 	}
 	var inode Ino
 	var attr = &Attr{}
 
 	if fs.conf.FastResolve {
-		err = fs.m.Resolve(ctx, 1, p, &inode, attr)
+		err = fs.m.Resolve(ctx, 1, p, &inode, attr, false)
 		if err == 0 {
 			fi = AttrToFileInfo(inode, attr)
 			p = strings.TrimRight(p, "/")
@@ -1024,7 +1106,7 @@ func (fs *FileSystem) Close() error {
 		fs.logBuffer = nil
 		close(buffer)
 	}
-	return nil
+	return fs.Meta().CloseSession()
 }
 
 func (fs *FileSystem) Clone(ctx meta.Context, src, dst string, preserve bool) (err syscall.Errno) {
@@ -1050,7 +1132,7 @@ func (fs *FileSystem) Clone(ctx meta.Context, src, dst string, preserve bool) (e
 		cmode |= meta.CLONE_MODE_PRESERVE_ATTR
 	}
 
-	if err = fs.m.Clone(meta.NewContext(ctx.Pid(), ctx.Uid(), ctx.Gids()), srcParent.Inode(), srcIno, dstParent.Inode(), path.Base(dst), cmode, umask, &count, &total); err != 0 {
+	if err = fs.m.Clone(meta.NewContext(ctx.Pid(), ctx.Uid(), ctx.Gids()), srcParent.Inode(), srcIno, dstParent.Inode(), path.Base(dst), cmode, umask, meta.CLONE_DEFAULT_CONCURRENCY, &count, &total); err != 0 {
 		logger.Errorf("clone failed srcIno:%d,dstParentIno:%d,dstName:%s,cmode:%d,umask:%d,eno:%v", srcIno, dstParent.Inode(), path.Base(dst), cmode, umask, err)
 	}
 	return
@@ -1072,10 +1154,10 @@ func (fs *FileSystem) Warmup(ctx meta.Context, paths []string, numthreads int, b
 	}
 }
 
-func (fs *FileSystem) HandleQuota(ctx meta.Context, path string, cmd uint8, capacity, inodes uint64, strict, repair, create bool) (qs map[string]*meta.Quota, err syscall.Errno) {
+func (fs *FileSystem) HandleQuota(ctx meta.Context, key string, cmd uint8, capacity, inodes uint64, strict, repair, create bool) (qs map[string]*meta.Quota, err syscall.Errno) {
 	l := vfs.NewLogContext(ctx)
 	defer func() {
-		fs.log(l, "QuotaCtl (%s,%d,%d,%d,%t,%t,%t): %s", path, cmd, capacity, inodes, create, repair, strict, errstr(err))
+		fs.log(l, "QuotaCtl (%s,%d,%d,%d,%t,%t,%t): %s", key, cmd, capacity, inodes, create, repair, strict, errstr(err))
 	}()
 	if cmd == meta.QuotaSet && capacity == 0 && inodes == 0 {
 		return nil, syscall.EINVAL
@@ -1089,10 +1171,31 @@ func (fs *FileSystem) HandleQuota(ctx meta.Context, path string, cmd uint8, capa
 		if inodes > 0 {
 			q.MaxInodes = int64(inodes)
 		}
-		qs[path] = q
+		qs[key] = q
 	}
 
-	if _err := fs.m.HandleQuota(meta.Background(), cmd, path, 0, 0, qs, strict, repair, create); _err != nil {
+	var qtype uint32
+	var qkey string
+	if strings.HasPrefix(key, "uid:") {
+		qtype = meta.UserQuotaType
+		qkey = key[4:]
+	} else if strings.HasPrefix(key, "gid:") {
+		qtype = meta.GroupQuotaType
+		qkey = key[4:]
+	} else if key != "" {
+		qtype = meta.DirQuotaType
+		qkey = key
+	} else {
+		qkey = ""
+		if cmd == meta.QuotaList {
+			qtype = meta.AllQuotaType
+		} else if cmd == meta.QuotaCheck {
+			qtype = meta.UserQuotaType
+		} else {
+			return nil, syscall.EINVAL
+		}
+	}
+	if _err := fs.m.HandleQuota(meta.Background(), cmd, qkey, qtype, qs, strict, repair, create); _err != nil {
 		if strings.HasPrefix(_err.Error(), "no quota for inode") {
 			return qs, 0
 		}
@@ -1296,7 +1399,7 @@ func (f *File) Pwrite(ctx meta.Context, b []byte, offset int64) (n int, err sysc
 
 func (f *File) pwrite(ctx meta.Context, b []byte, offset int64) (n int, err syscall.Errno) {
 	if f.wdata == nil {
-		f.wdata = f.fs.writer.Open(f.inode, uint64(f.info.Size()))
+		f.wdata = f.fs.writer.Open(f.inode, uint64(f.info.Size()), f.info.attr.Tier)
 	}
 	err = f.wdata.Write(ctx, uint64(offset), b)
 	if err != 0 {
@@ -1398,6 +1501,11 @@ func (f *File) Readdir(ctx meta.Context, count int) (fi []os.FileInfo, err sysca
 		if err != 0 {
 			return
 		}
+		if f.fs.conf.Meta.SortDir {
+			sort.Slice(inodes[2:], func(i, j int) bool {
+				return string(inodes[i].Name) < string(inodes[j].Name)
+			})
+		}
 		// skip . and ..
 		for _, n := range inodes[2:] {
 			i := AttrToFileInfo(n.Inode, n.Attr)
@@ -1435,6 +1543,11 @@ func (f *File) ReaddirPlus(ctx meta.Context, offset int) (entries []*meta.Entry,
 			if !bytes.Equal(e.Name, []byte{'.'}) && !bytes.Equal(e.Name, []byte("..")) {
 				f.entries = append(f.entries, e)
 			}
+		}
+		if f.fs.conf.Meta.SortDir {
+			sort.Slice(f.entries, func(i, j int) bool {
+				return string(f.entries[i].Name) < string(f.entries[j].Name)
+			})
 		}
 	}
 	if offset >= len(f.entries) {
@@ -1489,7 +1602,7 @@ func (f *File) GetQuota(ctx meta.Context) (quota *meta.Quota, err error) {
 		return quota, err
 	}
 	// get directory quota
-	err = f.fs.m.HandleQuota(ctx, meta.QuotaGet, f.path, 0, 0, qs, false, false, false)
+	err = f.fs.m.HandleQuota(ctx, meta.QuotaGet, f.path, meta.DirQuotaType, qs, false, false, false)
 	if err != nil {
 		return nil, err
 	}

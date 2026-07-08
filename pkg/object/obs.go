@@ -41,13 +41,15 @@ import (
 )
 
 const obsDefaultRegion = "cn-north-1"
+const obsTaggingHeader = "x-amz-tagging"
+const obsTaggingDirectiveHeader = "x-amz-tagging-directive"
 
 type obsClient struct {
 	bucket    string
 	region    string
 	checkEtag bool
-	sc        string
 	c         *obs.ObsClient
+	tierStorage
 }
 
 func (s *obsClient) String() string {
@@ -69,20 +71,14 @@ func (s *obsClient) Create(ctx context.Context) error {
 	params.Bucket = s.bucket
 	params.Location = s.region
 	params.AvailableZone = "3az"
-	params.StorageClass = obs.StorageClassType(s.sc)
+	params.StorageClass = obs.StorageClassType(s.tiers[0].Sc)
 	_, err := s.c.CreateBucket(params)
 	if err != nil && isExists(err) {
 		err = nil
 	}
 	return err
 }
-func getStorageClassStr(sc obs.StorageClassType) string {
-	if sc == "" {
-		return string(obs.StorageClassStandard)
-	} else {
-		return string(sc)
-	}
-}
+
 func (s *obsClient) Head(ctx context.Context, key string) (Object, error) {
 	params := &obs.GetObjectMetadataInput{
 		Bucket: s.bucket,
@@ -101,7 +97,8 @@ func (s *obsClient) Head(ctx context.Context, key string) (Object, error) {
 		r.ContentLength,
 		r.LastModified,
 		strings.HasSuffix(key, "/"),
-		getStorageClassStr(r.StorageClass),
+		getOrDefaultScValue(string(r.StorageClass), string(obs.StorageClassStandard)),
+		r.Restore,
 	}, nil
 }
 
@@ -119,7 +116,7 @@ func (s *obsClient) Get(ctx context.Context, key string, off, limit int64, gette
 	}
 	if resp != nil {
 		attrs := ApplyGetters(getters...)
-		attrs.SetRequestID(resp.RequestId).SetStorageClass(getStorageClassStr(resp.StorageClass))
+		attrs.SetRequestID(resp.RequestId).SetStorageClass(getOrDefaultScValue(string(resp.StorageClass), string(obs.StorageClassStandard)))
 	}
 	if err != nil {
 		return nil, err
@@ -168,26 +165,54 @@ func (s *obsClient) Put(ctx context.Context, key string, in io.Reader, getters .
 	params.ContentLength = vlen
 	params.ContentMD5 = base64.StdEncoding.EncodeToString(sum[:])
 	params.ContentType = mimeType
-	params.StorageClass = obs.StorageClassType(s.sc)
-	resp, err := s.c.PutObject(params)
+	t := s.GetTier(ctx)
+	params.StorageClass = obs.StorageClassType(t.Sc)
+	var resp *obs.PutObjectOutput
+	var err error
+	if t.encodedTag != "" {
+		resp, err = s.c.PutObject(params, obs.WithHeader(obsTaggingHeader, []string{t.encodedTag}))
+	} else {
+		resp, err = s.c.PutObject(params)
+	}
 	if err == nil && s.checkEtag && strings.Trim(resp.ETag, "\"") != obs.Hex(sum) {
 		err = fmt.Errorf("unexpected ETag: %s != %s", strings.Trim(resp.ETag, "\""), obs.Hex(sum))
 	}
 	if resp != nil {
 		attrs := ApplyGetters(getters...)
-		attrs.SetRequestID(resp.RequestId).SetStorageClass(getStorageClassStr(resp.StorageClass))
+		attrs.SetRequestID(resp.RequestId).SetStorageClass(getOrDefaultScValue(string(resp.StorageClass), string(obs.StorageClassStandard)))
 	}
 	return err
 }
 
 func (s *obsClient) Copy(ctx context.Context, dst, src string) error {
+	t := s.GetTier(ctx)
+	sc := getOrDefaultScValue(t.Sc, string(obs.StorageClassStandard))
 	params := &obs.CopyObjectInput{}
 	params.Bucket = s.bucket
 	params.Key = dst
 	params.CopySourceBucket = s.bucket
 	params.CopySourceKey = src
-	params.StorageClass = obs.StorageClassType(s.sc)
-	_, err := s.c.CopyObject(params)
+	params.StorageClass = obs.StorageClassType(sc)
+	var err error
+	if t.encodedTag != "" {
+		params.Metadata = map[string]string{}
+		// One of the object's metadata, storage class, or encryption attributes must be changed to successfully make a request
+		params.Metadata["Placeholder"] = "Placeholder"
+		_, err = s.c.CopyObject(params,
+			obs.WithHeader(obsTaggingHeader, []string{t.encodedTag}),
+			obs.WithHeader(obsTaggingDirectiveHeader, []string{"REPLACE"}))
+	} else {
+		_, err = s.c.CopyObject(params)
+	}
+	return err
+}
+func (s *obsClient) Restore(ctx context.Context, key string, days int32) error {
+	_, err := s.c.RestoreObject(&obs.RestoreObjectInput{
+		Bucket: s.bucket,
+		Key:    key,
+		Days:   int(days),
+		Tier:   "Standard",
+	})
 	return err
 }
 
@@ -221,7 +246,7 @@ func (s *obsClient) List(ctx context.Context, prefix, start, token, delimiter st
 	for i := 0; i < n; i++ {
 		// Obs SDK listObjects method already decodes the object key.
 		o := resp.Contents[i]
-		objs[i] = &obj{o.Key, o.Size, o.LastModified, strings.HasSuffix(o.Key, "/"), string(o.StorageClass)}
+		objs[i] = &obj{o.Key, o.Size, o.LastModified, strings.HasSuffix(o.Key, "/"), string(o.StorageClass), ""}
 	}
 	if delimiter != "" {
 		for _, p := range resp.CommonPrefixes {
@@ -229,7 +254,7 @@ func (s *obsClient) List(ctx context.Context, prefix, start, token, delimiter st
 			if err != nil {
 				return nil, false, "", errors.WithMessagef(err, "failed to decode commonPrefixes %s", p)
 			}
-			objs = append(objs, &obj{prefix, 0, time.Unix(0, 0), true, ""})
+			objs = append(objs, &obj{prefix, 0, time.Unix(0, 0), true, "", ""})
 		}
 		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
 	}
@@ -244,7 +269,7 @@ func (s *obsClient) CreateMultipartUpload(ctx context.Context, key string) (*Mul
 	params := &obs.InitiateMultipartUploadInput{}
 	params.Bucket = s.bucket
 	params.Key = key
-	params.StorageClass = obs.StorageClassType(s.sc)
+	params.StorageClass = obs.StorageClassType(s.tiers[0].Sc)
 	resp, err := s.c.InitiateMultipartUpload(params)
 	if err != nil {
 		return nil, err
@@ -328,11 +353,6 @@ func (s *obsClient) ListUploads(ctx context.Context, marker string) ([]*PendingP
 		nextMarker = result.NextKeyMarker
 	}
 	return parts, nextMarker, nil
-}
-
-func (s *obsClient) SetStorageClass(sc string) error {
-	s.sc = sc
-	return nil
 }
 
 func autoOBSEndpoint(bucketName, accessKey, secretKey, token string) (string, error) {

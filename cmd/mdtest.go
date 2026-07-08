@@ -22,6 +22,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path"
+	"runtime"
 	"sync"
 	"time"
 
@@ -35,8 +36,16 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-var ctx = meta.NewContext(1, uint32(os.Getuid()), []uint32{uint32(os.Getgid())})
+var ctx = meta.NewContext(1, uint32(utils.GetCurrentUID()), []uint32{uint32(utils.GetCurrentGID())})
 var umask = uint16(utils.GetUmask())
+
+func init() {
+	// For all the juicefs command, we treat admin/elevated privilege user as root(0) on Windows
+	// just like the mount option '-adminasroot' does for the mounted filesystem.
+	if runtime.GOOS == "windows" && utils.IsWinAdminOrElevatedPrivilege() {
+		ctx = meta.NewContext(1, 0, []uint32{0})
+	}
+}
 
 func createDir(jfs *fs.FileSystem, root string, d int, width int) error {
 	if err := jfs.Mkdir(ctx, root, 0777, umask); err != 0 {
@@ -113,11 +122,11 @@ func runTest(jfs *fs.FileSystem, rootDir string, np, width, depth, files, bytes 
 
 	start := time.Now()
 	if err := jfs.Mkdir(ctx, rootDir, 0777, umask); err != 0 {
-		logger.Errorf("mkdir %s: %s", rootDir, err)
+		logger.Errorf("mkdir %q: %s", rootDir, err)
 	}
 	root := path.Join(rootDir, "test-dir.0-0")
 	if err := jfs.Mkdir(ctx, root, 0777, umask); err != 0 {
-		logger.Fatalf("Mkdir %s: %s", root, err)
+		logger.Fatalf("Mkdir %q: %s", root, err)
 	}
 	root = path.Join(root, "mdtest_tree.0")
 	if err := createDir(jfs, root, depth, width); err != nil {
@@ -196,7 +205,7 @@ func initForMdtest(c *cli.Context, mp string, metaUrl string) *fs.FileSystem {
 		logger.Fatalf("load setting: %s", err)
 	}
 	if st := m.Chroot(meta.Background(), metaConf.Subdir); st != 0 {
-		logger.Fatalf("Chroot to %s: %s", metaConf.Subdir, st)
+		logger.Fatalf("Chroot to %q: %s", metaConf.Subdir, st)
 	}
 	registerer, registry := wrapRegister(c, mp, format.Name)
 

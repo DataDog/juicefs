@@ -1,4 +1,6 @@
 #!/bin/bash -e
+REDIS_CSC_QUERY="client-cache=false&client-cache-size=500&client-cache-expire=60s&client-cache-preload=100"
+
 retry() {
     local retries=5
     local delay=3
@@ -33,30 +35,43 @@ install_tikv(){
     echo user is $user
     if [[ "$user" == "root" ]]; then
         curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sudo sh
+        export PATH=/root/.tiup/bin:$PATH
         tiup=/root/.tiup/bin/tiup
     elif [[ "$user" == "runner" ]]; then
         curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+        export PATH=/home/runner/.tiup/bin:$PATH
         tiup=/home/runner/.tiup/bin/tiup
     else
         echo "Unknown user $user"
         exit 1
     fi
     echo tiup is $tiup
-    $tiup playground --mode tikv-slim > tikv.log 2>&1  &
+    echo $(whoami) $(pwd)
+    # TODO update to latest TiDB 
+    $tiup playground 8.5.5 --mode tikv-slim > tikv.log 2>&1  &
     pid=$!
     timeout=60
     count=0
     while true; do
+        # Check if tiup playground process is still alive
+        if ! kill -0 $pid 2>/dev/null; then
+            echo "tiup playground process (pid=$pid) exited unexpectedly."
+            echo "=== tikv.log ==="
+            cat tikv.log || true
+            exit 1
+        fi
         echo 'head -1' > /tmp/head.txt
         lsof -i:2379 && pgrep pd-server && tcli -pd 127.0.0.1:2379 < /tmp/head.txt && exit_code=0 || exit_code=$?
         if [ $exit_code -eq 0 ]; then
-            echo "TiDB is running."
+            echo "TiKV is running."
             exit 0
         fi
         sleep 1
         count=$((count+1))
         if [ $count -eq $timeout ]; then
-            echo "TiDB failed to start within $timeout seconds."
+            echo "TiKV failed to start within $timeout seconds."
+            echo "=== tikv.log ==="
+            tail -50 tikv.log || true
             kill -9 $pid || true
             exit 1
         fi
@@ -78,7 +93,7 @@ install_tidb(){
     fi
     echo tiup is $tiup
     
-    $tiup playground 5.4.0 > tidb.log 2>&1  &
+    $tiup playground 8.5.5 > tidb.log 2>&1  &
     pid=$!
     timeout=60
     count=0
@@ -120,7 +135,24 @@ start_meta_engine(){
         retry install_tidb
         mysql -h127.0.0.1 -P4000 -uroot -e "set global tidb_enable_noop_functions=1;"
     elif [ "$meta" == "etcd" ]; then
-        sudo .github/scripts/apt_install.sh etcd
+        sudo .github/scripts/apt_install.sh etcd-server etcd-client || \
+            sudo .github/scripts/apt_install.sh etcd
+        sudo systemctl unmask etcd etcd-server 2>/dev/null || true
+        sudo systemctl start etcd 2>/dev/null || \
+            sudo systemctl start etcd-server 2>/dev/null || true
+        timeout=30
+        count=0
+        until curl -fsS http://localhost:2379/health >/dev/null 2>&1; do
+            sleep 1
+            count=$((count+1))
+            if [ $count -eq $timeout ]; then
+                echo "etcd failed to start within $timeout seconds."
+                sudo journalctl -u etcd --no-pager | tail -50 || true
+                sudo journalctl -u etcd-server --no-pager | tail -50 || true
+                exit 1
+            fi
+        done
+        echo "etcd is running."
     elif [ "$meta" == "fdb" ]; then
         if lsof -i:4500; then
             echo "fdb is already running"
@@ -147,7 +179,7 @@ start_meta_engine(){
                 -e POSTGRES_USER=postgres \
                 -e POSTGRES_PASSWORD=postgres \
                 -p 5432:5432 \
-                -v /tmp/postgresql:/var/lib/postgresql/data \
+                -v /tmp/postgresql:/var/lib/postgresql \
                 -d postgres \
                 -N 300
             sleep 10
@@ -196,7 +228,7 @@ get_meta_url(){
     elif [ "$meta" == "mysql" ]; then
         meta_url="mysql://root:root@(127.0.0.1)/test?max_open_conns=30"
     elif [ "$meta" == "redis" ]; then
-        meta_url="redis://127.0.0.1:6379/1"
+        meta_url="redis://127.0.0.1:6379/1?${REDIS_CSC_QUERY}"
     elif [ "$meta" == "sqlite3" ]; then
         meta_url="sqlite3://test.db"
     elif [ "$meta" == "tikv" ]; then
@@ -229,7 +261,7 @@ get_meta_url2(){
     elif [ "$meta" == "mysql" ]; then
         meta_url="mysql://root:root@(127.0.0.1)/test2?max_open_conns=30"
     elif [ "$meta" == "redis" ]; then
-        meta_url="redis://127.0.0.1:6379/2"
+        meta_url="redis://127.0.0.1:6379/2?${REDIS_CSC_QUERY}"
     elif [ "$meta" == "sqlite3" ]; then
         meta_url="sqlite3://test2.db"
     elif [ "$meta" == "tikv" ]; then

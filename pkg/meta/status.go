@@ -69,6 +69,7 @@ func Status(ctx context.Context, m Meta, trash bool, sections *Sections) error {
 
 	if trash {
 		progress := utils.NewProgress(false)
+		defer progress.Done()
 		trashFileSpinner := progress.AddDoubleSpinner("Trash Files")
 		pendingDeletedFileSpinner := progress.AddDoubleSpinner("Pending Deleted Files")
 		trashSlicesSpinner := progress.AddDoubleSpinner("Trash Slices")
@@ -85,8 +86,8 @@ func Status(ctx context.Context, m Meta, trash bool, sections *Sections) error {
 				pendingDeletedSlicesSpinner.IncrInt64(int64(size))
 				return false, nil
 			},
-			func(_ Ino, size uint64, _ time.Time) (bool, error) {
-				trashFileSpinner.IncrInt64(int64(size))
+			func(_ Ino, size uint64, _ time.Time, count int64) (bool, error) {
+				trashFileSpinner.Add(count, int64(size))
 				return false, nil
 			},
 			func(_ Ino, size uint64, _ int64) (bool, error) {
@@ -102,7 +103,6 @@ func Status(ctx context.Context, m Meta, trash bool, sections *Sections) error {
 		pendingDeletedSlicesSpinner.Done()
 		trashFileSpinner.Done()
 		pendingDeletedFileSpinner.Done()
-		progress.Done()
 		stat.TrashSliceCount, stat.TrashSliceSize = trashSlicesSpinner.Current()
 		stat.PendingDeletedSliceCount, stat.PendingDeletedSliceSize = pendingDeletedSlicesSpinner.Current()
 		stat.TrashFileCount, stat.TrashFileSize = trashFileSpinner.Current()

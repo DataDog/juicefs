@@ -21,6 +21,7 @@ import json
 import locale
 import os
 import pwd
+import sys
 import six
 import struct
 import threading
@@ -80,7 +81,13 @@ def unpack(fmt, buf):
 
 class JuiceFSLib(object):
     def __init__(self):
-        self.lib = cdll.LoadLibrary(os.path.join(os.path.dirname(__file__), "libjfs.so"))
+        if sys.platform == "win32":
+            _ext = "dll"
+        elif sys.platform == "darwin":
+            _ext = "dylib"
+        else:
+            _ext = "so"
+        self.lib = cdll.LoadLibrary(os.path.join(os.path.dirname(__file__), f"libjfs.{_ext}"))
 
     def __getattr__(self, n):
         fn = getattr(self.lib, n)
@@ -161,10 +168,22 @@ class Client(object):
         groups = [grp.getgrgid(gid).gr_name for gid in os.getgrouplist(user.pw_name, user.pw_gid)]
         superuser = pwd.getpwuid(0)
         supergroups = [grp.getgrgid(gid).gr_name for gid in os.getgrouplist(superuser.pw_name, superuser.pw_gid)]
-        self.h = self.lib.jfs_init(name.encode(), jsonConf.encode(), user.pw_name.encode(), ','.join(groups).encode(), superuser.pw_name.encode(), ''.join(supergroups).encode())
+        self.h = self.lib.jfs_init(0, 0, name.encode(), jsonConf.encode(), user.pw_name.encode(), ','.join(groups).encode(), superuser.pw_name.encode(), ''.join(supergroups).encode())
 
     def __del__(self):
-        self.lib.jfs_term(c_int64(_tid()), c_int64(self.h))
+        self.close(terminate=False)
+
+    def close(self, terminate=False):
+        """Close the JuiceFS client.
+        
+        Args:
+            terminate: If True, fully close the filesystem and stop
+                       background goroutines. If False (default), only
+                       flush and keep the filesystem cached for reuse.
+        """
+        if hasattr(self, 'h') and self.h:
+            self.lib.jfs_term(c_int64(_tid()), c_int64(self.h), 1 if terminate else 0)
+            self.h = 0
 
     def stat(self, path):
         """Get the status of a file or a directory."""
@@ -419,14 +438,25 @@ class Client(object):
         self.lib.free(buf)
         return res
 
-    def warmup(self, paths, numthreads=10, background=False, isEvict=False, isCheck=False):
+    def warmup(self, paths, threads=10, evict=False, check=False, background=False, **kwargs):
+        # numthreads=10, background=False, isEvict=False, isCheck=False,
+        for k in kwargs:
+            if k == 'numthreads':
+                threads = kwargs[k]
+            elif k == 'isEvict':
+                evict = kwargs[k]
+            elif k == 'isCheck':
+                check = kwargs[k]
+            else:
+                raise TypeError(f"warmup() got an unexpected keyword argument '{k}'")
+
         """Warm up a file or a directory."""
         if type(paths) is not list:
             paths = [paths]
 
         buf = c_void_p()
 
-        n = self.lib.jfs_warmup(c_int64(_tid()), c_int64(self.h), json.dumps(paths).encode(), c_int32(numthreads), c_bool(background), c_bool(isEvict), c_bool(isCheck), byref(buf))
+        n = self.lib.jfs_warmup(c_int64(_tid()), c_int64(self.h), json.dumps(paths).encode(), c_int32(threads), c_bool(background), c_bool(evict), c_bool(check), byref(buf))
         res = json.loads(str(string_at(buf, n), encoding='utf-8'))
         self.lib.free(buf)
         return res

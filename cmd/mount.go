@@ -27,6 +27,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -86,10 +87,11 @@ func exposeMetrics(c *cli.Context, registerer prometheus.Registerer, registry *p
 	// default set
 	ip, port, err := net.SplitHostPort(c.String("metrics"))
 	if err != nil {
-		logger.Fatalf("metrics format error: %v", err)
+		logger.Fatalf("metrics format error %q: %v", c.String("metrics"), err)
 	}
 	go metric.UpdateMetrics(registerer)
-	http.Handle("/metrics", promhttp.HandlerFor(
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(
 		registry,
 		promhttp.HandlerOpts{
 			// Opt into OpenMetrics to support exemplars.
@@ -114,7 +116,7 @@ func exposeMetrics(c *cli.Context, registerer prometheus.Registerer, registry *p
 	if err != nil {
 		// Don't try other ports on metrics set but listen failed
 		if c.IsSet("metrics") {
-			logger.Errorf("listen on %s:%s failed: %v", ip, port, err)
+			logger.Errorf("listen on %q:%q failed: %v", ip, port, err)
 			return ""
 		}
 		// Listen port on 0 will auto listen on a free port
@@ -126,13 +128,13 @@ func exposeMetrics(c *cli.Context, registerer prometheus.Registerer, registry *p
 	}
 
 	go func() {
-		if err := http.Serve(ln, nil); err != nil {
+		if err := http.Serve(ln, mux); err != nil {
 			logger.Errorf("Serve for metrics: %s", err)
 		}
 	}()
 
 	metricsAddr := ln.Addr().String()
-	logger.Infof("Prometheus metrics listening on %s", metricsAddr)
+	logger.Infof("Prometheus metrics listening on %q", metricsAddr)
 	return metricsAddr
 }
 
@@ -147,10 +149,10 @@ func wrapRegister(c *cli.Context, mp, name string) (prometheus.Registerer, *prom
 		for _, kv := range strings.Split(c.String("custom-labels"), ";") {
 			splited := strings.Split(kv, ":")
 			if len(splited) != 2 {
-				logger.Fatalf("invalid label format: %s", kv)
+				logger.Fatalf("invalid label format: %q", kv)
 			}
 			if utils.StringContains([]string{"mp", "vol_name", "instance"}, splited[0]) {
-				logger.Warnf("overriding reserved label: %s", splited[0])
+				logger.Warnf("overriding reserved label: %q", splited[0])
 			}
 			commonLabels[splited[0]] = splited[1]
 		}
@@ -172,8 +174,21 @@ func updateFormat(c *cli.Context) func(*meta.Format) {
 		if c.IsSet("storage") {
 			format.Storage = c.String("storage")
 		}
-		if c.IsSet("storage-class") {
-			format.StorageClass = c.String("storage-class")
+		or := func(x, y string) string {
+			if x != "" {
+				return x
+			}
+			return y
+		}
+		t := c.String("tag")
+		if !object.ValidateTag(t) {
+			logger.Warnf("Invalid tag format: %s", t)
+			t = ""
+		}
+		format.Tiers[0] = object.Tier{
+			ID:  0,
+			Sc:  or(c.String("storage-class"), format.Tiers[0].Sc),
+			Tag: or(t, format.Tiers[0].Tag),
 		}
 		if c.IsSet("upload-limit") {
 			format.UploadLimit = utils.ParseMbps(c, "upload-limit")
@@ -192,13 +207,13 @@ func relPathToAbs(ss []string) []string {
 			if h, err := os.UserHomeDir(); err == nil {
 				ss[i] = filepath.Join(h, d[1:])
 			} else {
-				logger.Fatalf("Expand user home dir of %s: %s", d, err)
+				logger.Fatalf("Expand user home dir of %q: %s", d, err)
 			}
 		} else {
 			if ad, err := filepath.Abs(d); err == nil {
 				ss[i] = ad
 			} else {
-				logger.Fatalf("Find absolute path of %s: %s", d, err)
+				logger.Fatalf("Find absolute path of %q: %s", d, err)
 			}
 		}
 	}
@@ -288,7 +303,7 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 	if c.IsSet("umask") {
 		umask, err := strconv.ParseUint(c.String("umask"), 8, 16)
 		if err != nil {
-			logger.Fatalf("invalid umask %s: %s", c.String("umask"), err)
+			logger.Fatalf("invalid umask %q: %s", c.String("umask"), err)
 		}
 		cfg.UMask = uint16(umask)
 	}
@@ -305,7 +320,7 @@ func registerMetaMsg(m meta.Meta, store chunk.ChunkStore, chunkConf *chunk.Confi
 		return store.Remove(args[0].(uint64), int(args[1].(uint32)))
 	})
 	m.OnMsg(meta.CompactChunk, func(args ...interface{}) error {
-		return vfs.Compact(*chunkConf, store, args[0].([]meta.Slice), args[1].(uint64))
+		return vfs.Compact(*chunkConf, store, args[0].([]meta.Slice), args[1].(uint64), args[2].(uint8))
 	})
 }
 
@@ -336,7 +351,7 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 
 	atimeMode := c.String("atime-mode")
 	if atimeMode != meta.RelAtime && atimeMode != meta.StrictAtime && atimeMode != meta.NoAtime {
-		logger.Warnf("unknown atime-mode \"%s\", changed to %s", atimeMode, meta.NoAtime)
+		logger.Warnf("unknown atime-mode %q, changed to %q", atimeMode, meta.NoAtime)
 		atimeMode = meta.NoAtime
 	}
 	conf.AtimeMode = atimeMode
@@ -356,7 +371,7 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 	cm, err := strconv.ParseUint(c.String("cache-mode"), 8, 32)
 	if err != nil {
-		logger.Warnf("Invalid cache-mode %s, using default value 0600", c.String("cache-mode"))
+		logger.Warnf("Invalid cache-mode %q, using default value 0600", c.String("cache-mode"))
 		cm = 0600
 	}
 	chunkConf := &chunk.Config{
@@ -364,18 +379,20 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		Compress:   format.Compression,
 		HashPrefix: format.HashPrefix,
 
-		GetTimeout:    utils.Duration(c.String("get-timeout")),
-		PutTimeout:    utils.Duration(c.String("put-timeout")),
-		MaxUpload:     c.Int("max-uploads"),
-		MaxStageWrite: c.Int("max-stage-write"),
-		MaxRetries:    c.Int("io-retries"),
-		Writeback:     c.Bool("writeback"),
-		Prefetch:      c.Int("prefetch"),
-		BufferSize:    utils.ParseBytes(c, "buffer-size", 'M'),
-		UploadLimit:   utils.ParseMbps(c, "upload-limit") * 1e6 / 8,
-		DownloadLimit: utils.ParseMbps(c, "download-limit") * 1e6 / 8,
-		UploadDelay:   utils.Duration(c.String("upload-delay")),
-		UploadHours:   c.String("upload-hours"),
+		GetTimeout:             utils.Duration(c.String("get-timeout")),
+		PutTimeout:             utils.Duration(c.String("put-timeout")),
+		MaxUpload:              c.Int("max-uploads"),
+		MaxDownload:            c.Int("max-downloads"),
+		MaxStageWrite:          c.Int("max-stage-write"),
+		MaxRetries:             c.Int("io-retries"),
+		Writeback:              c.Bool("writeback"),
+		WritebackThresholdSize: int(utils.ParseBytes(c, "writeback-threshold-size", 'B')),
+		Prefetch:               c.Int("prefetch"),
+		BufferSize:             utils.ParseBytes(c, "buffer-size", 'M'),
+		UploadLimit:            utils.ParseMbps(c, "upload-limit") * 1e6 / 8,
+		DownloadLimit:          utils.ParseMbps(c, "download-limit") * 1e6 / 8,
+		UploadDelay:            utils.Duration(c.String("upload-delay")),
+		UploadHours:            c.String("upload-hours"),
 
 		CacheDir:          c.String("cache-dir"),
 		CacheSize:         utils.ParseBytes(c, "cache-size", 'M'),
@@ -410,6 +427,9 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 func initBackgroundTasks(c *cli.Context, vfsConf *vfs.Config, metaConf *meta.Config, m meta.Meta, blob object.ObjectStorage, registerer prometheus.Registerer, registry *prometheus.Registry) {
 	metricsAddr := exposeMetrics(c, registerer, registry)
 	m.InitMetrics(registerer)
+	if !metaConf.NoBGJob {
+		m.InitSharedMetrics(registerer)
+	}
 	vfs.InitMetrics(registerer)
 	vfsConf.Port.PrometheusAgent = metricsAddr
 	if c.IsSet("consul") {
@@ -456,9 +476,8 @@ func NewReloadableStorage(format *meta.Format, cli meta.Meta, patch func(*meta.F
 			patch(new)
 		}
 		old := &holder.fmt
-		if new.Storage != old.Storage || new.Bucket != old.Bucket || new.AccessKey != old.AccessKey || new.SecretKey != old.SecretKey || new.SessionToken != old.SessionToken || new.StorageClass != old.StorageClass {
-			logger.Infof("found new configuration: storage=%s bucket=%s ak=%s storageClass=%s", new.Storage, new.Bucket, new.AccessKey, new.StorageClass)
-
+		if new.Storage != old.Storage || new.Bucket != old.Bucket || new.AccessKey != old.AccessKey || new.SecretKey != old.SecretKey || new.SessionToken != old.SessionToken || new.Tiers[0].Sc != old.Tiers[0].Sc || !reflect.DeepEqual(new.Tiers, old.Tiers) {
+			logger.Infof("found new configuration: storage=%q bucket=%q ak=%q storageClass=%q tiers=%v", new.Storage, new.Bucket, new.AccessKey, new.Tiers[0].Sc, new.Tiers)
 			newBlob, err := createStorage(*new)
 			if err != nil {
 				logger.Warnf("object storage: %s", err)
@@ -547,7 +566,7 @@ func mount(c *cli.Context) error {
 			return err
 		}, time.Second*3)
 		if err != nil {
-			logger.Fatalf("abs %s: %s", mp, err)
+			logger.Fatalf("abs %q: %s", mp, err)
 		}
 		if mp == "/" {
 			logger.Fatalf("should not mount on the root directory")
@@ -565,7 +584,7 @@ func mount(c *cli.Context) error {
 					logger.Warnf("failed to update fstab: %s", e2)
 				}
 				if e1 == nil && e2 == nil {
-					logger.Infof("Successfully updated fstab, now you can mount with `mount %s`", mp)
+					logger.Infof("Successfully updated fstab, now you can mount with `mount %q`", mp)
 				}
 			}
 		}
@@ -612,7 +631,7 @@ func mount(c *cli.Context) error {
 			// test storage at startup to fail fast instead of throwing EIO in the middle of user's workload
 			if c.Bool("check-storage") {
 				start := time.Now()
-				if err = test(blob); err != nil {
+				if err = test(context.Background(), blob); err != nil {
 					logger.Errorf("Object storage test failed: %s", err)
 					return err
 				} else {
@@ -675,6 +694,6 @@ func mount(c *cli.Context) error {
 	}
 	err = metaCli.CloseSession()
 	object.Shutdown(blob)
-	logger.Infof("The juicefs mount process exit successfully, mountpoint: %s", metaConf.MountPoint)
+	logger.Infof("The juicefs mount process exit successfully, mountpoint: %q", metaConf.MountPoint)
 	return err
 }

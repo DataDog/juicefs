@@ -18,13 +18,16 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/dustin/go-humanize"
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/pkg/errors"
@@ -93,6 +96,33 @@ func configManagementFlags() []cli.Flag {
 			Name:  "user-group-quota",
 			Usage: "enable user and group quota management",
 		},
+		&cli.BoolFlag{
+			Name:  "changelog",
+			Usage: "enable changelog",
+		},
+		&cli.DurationFlag{
+			Name:        "changelog-max-age",
+			Usage:       "max age of changelog entries (e.g. 2h, 30m); 0 to disable time-based cleanup",
+			Value:       2 * time.Hour,
+			DefaultText: "2h",
+		},
+		&cli.Int64Flag{
+			Name:  "changelog-max-lines",
+			Usage: "max number of changelog entries to keep; 0 means unlimited",
+		},
+		&cli.IntFlag{
+			Name:  "tier",
+			Usage: "tier (0-3; 0 is default tier when unset)",
+			Action: func(ctx *cli.Context, v int) error {
+				if !ctx.IsSet("tier") {
+					return nil
+				}
+				if v < 0 || v > 3 {
+					return fmt.Errorf("tier should be between 0 and 3")
+				}
+				return nil
+			},
+		},
 	})
 }
 
@@ -145,9 +175,14 @@ func config(ctx *cli.Context) error {
 
 	originDirStats := format.DirStats
 	originUGQuota := format.UserGroupQuota
-	var quota, storage, trash, clientVer bool
+	var quota, storage, trash, clientVer, tier bool
 	var msg strings.Builder
 	encrypted := format.KeyEncrypted
+	var targetTierID uint8
+	var currentTier object.Tier
+	var findTier bool
+	var newTier object.Tier
+
 	for _, flag := range ctx.LocalFlagNames() {
 		switch flag {
 		case "capacity":
@@ -173,13 +208,15 @@ func config(ctx *cli.Context) error {
 		case "bucket":
 			// bucket will be accessed before storage, so it is necessary to determine if storage is a file
 			if new := ctx.String(flag); new != format.Bucket {
-				oldStorage := format.Storage
-				newStorage := ctx.String("storage")
-				if newStorage == "file" || (oldStorage == "file" && newStorage == "") {
+				effectiveStorage := format.Storage
+				if ctx.IsSet("storage") {
+					effectiveStorage = ctx.String("storage")
+				}
+				if effectiveStorage == "file" {
 					if p, err := filepath.Abs(new); err == nil {
 						new = p + "/"
 					} else {
-						logger.Fatalf("Failed to get absolute path of %s: %s", new, err)
+						logger.Fatalf("Failed to get absolute path of %q: %s", new, err)
 					}
 				}
 				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, format.Bucket, new))
@@ -187,12 +224,18 @@ func config(ctx *cli.Context) error {
 				storage = true
 			}
 		case "access-key":
+			if ctx.IsSet("tier") {
+				continue
+			}
 			if new := ctx.String(flag); new != format.AccessKey {
 				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, format.AccessKey, new))
 				format.AccessKey = new
 				storage = true
 			}
 		case "secret-key": // always update
+			if ctx.IsSet("tier") {
+				continue
+			}
 			msg.WriteString(fmt.Sprintf("%10s: updated\n", flag))
 			if err := format.Decrypt(); err != nil && strings.Contains(err.Error(), "secret was removed") {
 				logger.Warnf("decrypt secrets: %s", err)
@@ -200,6 +243,9 @@ func config(ctx *cli.Context) error {
 			format.SecretKey = ctx.String(flag)
 			storage = true
 		case "session-token": // always update
+			if ctx.IsSet("tier") {
+				continue
+			}
 			msg.WriteString(fmt.Sprintf("%10s: updated\n", flag))
 			if err := format.Decrypt(); err != nil && strings.Contains(err.Error(), "secret was removed") {
 				logger.Warnf("decrypt secrets: %s", err)
@@ -207,10 +253,32 @@ func config(ctx *cli.Context) error {
 			format.SessionToken = ctx.String(flag)
 			storage = true
 		case "storage-class": // always update
-			if new := ctx.String(flag); new != format.StorageClass {
-				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, format.StorageClass, new))
-				format.StorageClass = new
+			if ctx.IsSet("tier") {
+				continue
+			}
+			if new := ctx.String(flag); new != format.Tiers[0].Sc {
+				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, format.Tiers[0].Sc, new))
+				newTier := format.Tiers[0]
+				newTier.Sc = new
+				format.Tiers[0] = newTier
 				storage = true
+				tier = true
+			}
+		case "tag":
+			if ctx.IsSet("tier") {
+				continue
+			}
+			new := ctx.String(flag)
+			if !object.ValidateTag(new) {
+				logger.Fatalf("Invalid tag format: %s", new)
+			}
+			if new != format.Tiers[0].Tag {
+				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, format.Tiers[0].Tag, new))
+				newTier := format.Tiers[0]
+				newTier.Tag = new
+				format.Tiers[0] = newTier
+				storage = true
+				tier = true
 			}
 		case "upload-limit":
 			if new := utils.ParseMbps(ctx, flag); new != format.UploadLimit {
@@ -235,6 +303,33 @@ func config(ctx *cli.Context) error {
 			if new := ctx.Bool(flag); new != format.DirStats {
 				msg.WriteString(fmt.Sprintf("%10s: %t -> %t\n", flag, format.DirStats, new))
 				format.DirStats = new
+			}
+		case "changelog":
+			if new := ctx.Bool(flag); new != format.ChangeLog {
+				msg.WriteString(fmt.Sprintf("%10s: %t -> %t\n", flag, format.ChangeLog, new))
+				format.ChangeLog = new
+				if new && format.ChangeLogMaxAge == 0 && !ctx.IsSet("changelog-max-age") {
+					format.ChangeLogMaxAge = 7200
+					msg.WriteString(fmt.Sprintf("%10s: 0s -> %s (default)\n", "changelog-max-age", time.Duration(7200)*time.Second))
+				}
+			}
+		case "changelog-max-age":
+			d := ctx.Duration(flag)
+			if d < 0 {
+				return fmt.Errorf("negative duration for %s: %s", flag, d)
+			}
+			newAge := int64(d.Seconds())
+			if newAge != format.ChangeLogMaxAge {
+				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, time.Duration(format.ChangeLogMaxAge)*time.Second, d))
+				format.ChangeLogMaxAge = newAge
+			}
+		case "changelog-max-lines":
+			if new := ctx.Int64(flag); new != format.ChangeLogMaxLines {
+				if new < 0 {
+					return fmt.Errorf("negative value for %s: %d", flag, new)
+				}
+				msg.WriteString(fmt.Sprintf("%10s: %d -> %d\n", flag, format.ChangeLogMaxLines, new))
+				format.ChangeLogMaxLines = new
 			}
 		case "user-group-quota":
 			if new := ctx.Bool(flag); new != format.UserGroupQuota {
@@ -285,6 +380,51 @@ func config(ctx *cli.Context) error {
 				format.MinClientVersion = "1.3.0-A"
 				clientVer = true
 			}
+		case "kerberos-config-file":
+			msg.WriteString(fmt.Sprintf("%s: updated\n", flag))
+			format.KerbConf = readKerbConf(ctx.String(flag))
+			format.MinClientVersion = "1.4.0-A"
+			clientVer = true
+		case "tier":
+			if ctx.IsSet("bucket") || ctx.IsSet("access-key") || ctx.IsSet("secret-key") || ctx.IsSet("session-token") {
+				logger.Fatalf("Current tiered storage does not support multi-bucket mode")
+			}
+			targetTierID = uint8(ctx.Int(flag))
+			currentTier, findTier = format.Tiers[targetTierID]
+			if !findTier {
+				currentTier = object.Tier{ID: targetTierID}
+			}
+			newTier = object.Tier{
+				ID:  targetTierID,
+				Sc:  currentTier.Sc,
+				Tag: currentTier.Tag,
+			}
+			var change bool
+			if ctx.IsSet("storage-class") {
+				change = true
+				newTier.Sc = ctx.String("storage-class")
+				if !findTier || currentTier.Sc != newTier.Sc {
+					msg.WriteString(fmt.Sprintf("set tier %d storage-class: %s\n", targetTierID, newTier.Sc))
+					tier = true
+				}
+			}
+
+			if ctx.IsSet("tag") {
+				change = true
+				newTier.Tag = ctx.String("tag")
+				if !object.ValidateTag(newTier.Tag) {
+					logger.Fatalf("Invalid tag format: %s", newTier.Tag)
+				}
+				if !findTier || currentTier.Tag != newTier.Tag {
+					msg.WriteString(fmt.Sprintf("set tier %d tag: %s\n", targetTierID, newTier.Tag))
+					tier = true
+				}
+			}
+			if change {
+				format.Tiers[targetTierID] = newTier
+			} else {
+				logger.Fatalf("missing required flag: --storage-class or --tag")
+			}
 		}
 	}
 	if msg.Len() == 0 {
@@ -294,12 +434,12 @@ func config(ctx *cli.Context) error {
 
 	if !ctx.Bool("force") {
 		yes := ctx.Bool("yes")
-		if storage {
+		if storage || tier {
 			blob, err := createStorage(*format)
 			if err != nil {
 				return err
 			}
-			if err = test(blob); err != nil {
+			if err = test(context.WithValue(context.Background(), object.TierKey{}, targetTierID), blob); err != nil {
 				return err
 			}
 		}
@@ -324,7 +464,7 @@ func config(ctx *cli.Context) error {
 		}
 		if originDirStats && !format.DirStats {
 			qs := make(map[string]*meta.Quota)
-			err := m.HandleQuota(meta.Background(), meta.QuotaList, "", 0, 0, qs, false, false, false)
+			err := m.HandleQuota(meta.Background(), meta.QuotaList, "", meta.DirQuotaType, qs, false, false, false)
 			if err != nil {
 				return errors.Wrap(err, "list quotas")
 			}
@@ -354,6 +494,21 @@ func config(ctx *cli.Context) error {
 				}
 				if warnMsg != "" {
 					fmt.Println(warnMsg)
+				}
+			}
+		}
+		if tier {
+			if findTier && (currentTier.Sc != newTier.Sc || currentTier.Tag != newTier.Tag) {
+				fmt.Printf("existing tier will be overwritten: \n")
+				fmt.Printf("tier: %d\n", currentTier.ID)
+				if ctx.IsSet("storage-class") && currentTier.Sc != newTier.Sc {
+					fmt.Printf("storage class: %s => %s\n", currentTier.Sc, newTier.Sc)
+				}
+				if ctx.IsSet("tag") && currentTier.Tag != newTier.Tag {
+					fmt.Printf("tag: %s => %s\n", currentTier.Tag, newTier.Tag)
+				}
+				if !yes && !userConfirmed() {
+					return fmt.Errorf("Aborted.")
 				}
 			}
 		}

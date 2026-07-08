@@ -17,19 +17,66 @@
 package utils
 
 import (
+	"fmt"
 	"os/exec"
 	"strconv"
 	"syscall"
 
+	"github.com/juicedata/juicefs/pkg/win"
 	"golang.org/x/sys/windows"
 )
 
-func GetFileInode(path string) (uint64, error) {
+func GetCurrentUID() int {
+	return win.GetCurrentUID()
+}
+
+func GetCurrentGID() int {
+	return win.GetCurrentGID()
+}
+
+func GetCurrentUserSIDStr() string {
+	sid, err := win.GetCurrentUserSID()
+	if err != nil {
+		logger.Warnf("failed to get sid for current user, %s", err)
+		return ""
+	}
+
+	return fmt.Sprintf("%s (%s)", sid.String(), win.GetSidName(sid, true))
+}
+
+func GetCurrentUserGroupSIDStr() string {
+	sid, err := win.GetCurrentUserPrimaryGroupSID()
+	if err != nil {
+		logger.Warnf("failed to get sid for current user, %s", err)
+		return ""
+	}
+
+	return fmt.Sprintf("%s (%s)", sid.String(), win.GetSidName(sid, true))
+}
+
+func IsWinAdminOrElevatedPrivilege() bool {
+	uid := GetCurrentUID()
+	if uid == win.AdministratorUIDFromFUSE {
+		return true
+	}
+	elevated, err := win.IsProcessElevated()
+	if err != nil {
+		logger.Warnf("failed to determine if process is elevated, %s", err)
+		return false
+	}
+	return elevated
+}
+
+func getFileInode(path string, follow bool) (uint64, error) {
 	pathU16, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, err
 	}
-	fd, err := windows.CreateFile(pathU16, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	var flagsAndAttributes uint32 = windows.FILE_FLAG_BACKUP_SEMANTICS
+	if !follow {
+		flagsAndAttributes |= windows.FILE_FLAG_OPEN_REPARSE_POINT
+	}
+	fd, err := windows.CreateFile(pathU16, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, flagsAndAttributes, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -40,6 +87,14 @@ func GetFileInode(path string) (uint64, error) {
 		return 0, err
 	}
 	return uint64(data.FileIndexHigh)<<32 + uint64(data.FileIndexLow), nil
+}
+
+func GetFileInode(path string) (uint64, error) {
+	return getFileInode(path, true)
+}
+
+func GetFileInodeNotFollow(path string) (uint64, error) {
+	return getFileInode(path, false)
 }
 
 func GetKernelVersion() (major, minor int) { return }

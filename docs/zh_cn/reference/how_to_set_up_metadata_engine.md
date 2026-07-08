@@ -31,6 +31,23 @@ JuiceFS 采用数据和元数据分离的存储架构，元数据可以存储在
 
 JuiceFS 要求使用 4.0 及以上版本的 Redis。JuiceFS 也支持使用 Redis Cluster 作为元数据引擎，但为了避免在 Redis 集群中执行跨节点事务，同一个文件系统的元数据总会坐落于单个 Redis 实例中。
 
+:::tip Redis Cluster 键前缀
+使用 Redis Cluster 时，URL 中的数据库编号会被用作**键前缀**，而不是用于实际的数据库选择（因为 Redis Cluster 仅支持数据库 0）。前缀格式为 `{N}`（例如 `{1}`、`{2}`），使用 Redis 哈希标签（hash tag）确保同一个卷的所有键都被路由到同一个槽（slot）。这使得多个 JuiceFS 文件系统可以共享同一个 Redis Cluster：
+
+```shell
+# 不同的卷使用不同的数据库编号作为键前缀
+juicefs format redis://cluster:6379/1 volume1   # 键前缀为 {1}
+juicefs format redis://cluster:6379/2 volume2   # 键前缀为 {2}
+```
+
+可以使用以下命令在 Redis Cluster 中验证键：
+
+```shell
+redis-cli -c -h <host> -p 6379 keys '{1}*'   # 列出前缀为 {1} 的所有键
+```
+
+:::
+
 为了保证元数据安全，JuiceFS 需要 [`maxmemory-policy noeviction`](https://redis.io/docs/reference/eviction/)，否则在启动 JuiceFS 的时候将会尝试将其设置为 `noeviction`，如果设置失败将会打印告警日志。更多可以参考 [Redis 最佳实践](../administration/metadata/redis_best_practices.md)。
 
 #### 创建文件系统
@@ -112,7 +129,7 @@ juicefs mount -d "redis://192.168.1.6:6379/1" /mnt/jfs
 
 JuiceFS 同时支持 Redis 的 TLS 单向加密认证和 mTLS 双向加密认证连接。通过 TLS 或 mTLS 连接到 Redis 时均使用 `rediss://` 协议头，但是在使用 TLS 单向加密认证时，不需要指定客户端证书和私钥。
 
-:::note
+:::note 注意
 对 Redis mTLS 功能的支持需要使用 1.1.0 及以上版本的 JuiceFS
 :::
 
@@ -136,15 +153,21 @@ juicefs format --storage s3 \
 
 上例中的 `/etc/certs` 只是一个目录，实际使用时请替换为你的证书目录，可以使用相对路径或绝对路径。
 
+### Valkey
+
+[Valkey](https://valkey.io) 是 Redis 的一个开源分支，旨在保留该项目由社区驱动的治理模式，同时保持与 Redis 生态系统的高度兼容。Valkey 专注于在中立的方式下维护稳定性、提升性能并持续创新，从而为依赖 Redis 兼容工作负载的用户确保长期可用性。
+
+在用于 JuiceFS 的元数据存储引擎时，Valkey 的功能与 Redis 完全相同。请参考 Valkey 的[文档](https://valkey.io/topics/installation)进行安装以及了解其他相关内容，同时参考本文档 [Redis](#redis) 章节了解使用方法。
+
 ### KeyDB
 
-[KeyDB](https://keydb.dev) 是 Redis 的开源分支，在开发上保持与 Redis 主线对齐。KeyDB 在 Redis 的基础上实现了多线程支持、更好的内存利用率和更大的吞吐量，另外还支持 [Active Replication](https://github.com/JohnSully/KeyDB/wiki/Active-Replication)，即 Active Active（双活）功能。
+[KeyDB](https://keydb.dev) 是 Redis 的一个开源分支，其开发目的是与 Redis 社区保持一致。KeyDB 在 Redis 的基础上实现了多线程支持、更优的内存利用率以及更高的吞吐量，同时还支持 [Active Replication](https://docs.keydb.dev/docs/active-rep)，即 Active-Active（双活）功能。KeyDB 被认为与 Redis 6 版本兼容，但目前[不再被其社区积极维护](https://github.com/Snapchat/KeyDB/issues/895)。
 
 :::note 注意
-KeyDB 的数据复制是异步的，使用 Active Active（双活）功能可能导致数据一致性问题，请务必充分验证、谨慎使用！
+KeyDB 的 Active Replication 功能是异步复制的，可能会导致一致性问题，请务必充分验证、谨慎使用！
 :::
 
-在用于 JuiceFS 元数据存储时，KeyDB 与 Redis 的用法完全一致，这里不再赘述，请参考 [Redis](#redis) 部分使用。
+在用于 JuiceFS 的元数据存储引擎时，KeyDB 的功能与 Redis 完全相同。请参考 KeyDB 的[文档](https://docs.keydb.dev/docs)进行安装以及了解其他相关内容，同时参考本文档 [Redis](#redis) 章节了解使用方法。
 
 ## 键值数据库
 
@@ -474,7 +497,7 @@ mysql://<username>[:<password>]@unix(<socket-file-path>)/<database-name>
 :::note 注意
 
 1. 不要漏掉 URL 两边的 `()` 括号
-2. 密码中的特殊字符不需要进行 url 编码
+2. 密码中的特殊字符不需要进行 URL 编码
 
 :::
 
@@ -598,12 +621,12 @@ juicefs format \
     pics
 ```
 
-:::note 说明
+:::note 注意
 
 1. JuiceFS 默认使用的 public [schema](https://www.postgresql.org/docs/current/ddl-schemas.html) ，如果要使用非 `public schema`，需要在连接字符串中指定 `search_path` 参数，例如 `postgres://user:mypassword@192.168.1.6:5432/juicefs?search_path=pguser1`
 2. 如果 `public schema` 并非是 PostgreSQL 服务端配置的 `search_path` 中第一个命中的，则必须在连接字符串中明确设置 `search_path` 参数
 3. `search_path` 连接参数原生可以设置为多个 schema，但是目前 JuiceFS 仅支持设置一个。`postgres://user:mypassword@192.168.1.6:5432/juicefs?search_path=pguser1,public` 将被认为不合法
-4. 密码中的特殊字符需要进行 url 编码，例如 `|` 需要编码为`%7C`。
+4. 密码中的特殊字符需要进行 URL 编码，例如 `|` 需要编码为`%7C`。
 
 :::
 

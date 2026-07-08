@@ -90,6 +90,7 @@ const (
 	SetAttrAtimeNow
 	SetAttrMtimeNow
 	SetAttrCtimeNow
+	SetAttrTier
 	SetAttrFlag = 1 << 15
 )
 
@@ -173,12 +174,17 @@ type Attr struct {
 
 	AccessACL  uint32 // access ACL id (identical ACL rules share the same access ACL ID.)
 	DefaultACL uint32 // default ACL id (default ACL and the access ACL share the same cache and store)
+
+	Tier uint8 // storage tier of the file
 }
 
 func (attr *Attr) Marshal() []byte {
 	size := uint32(36 + 24 + 4 + 8)
 	if attr.AccessACL|attr.DefaultACL != aclAPI.None {
 		size += 8
+	}
+	if attr.Tier != 0 {
+		size += 1
 	}
 	w := utils.NewBuffer(size)
 	w.Put8(attr.Flags)
@@ -198,6 +204,9 @@ func (attr *Attr) Marshal() []byte {
 	if attr.AccessACL+attr.DefaultACL > 0 {
 		w.Put32(attr.AccessACL)
 		w.Put32(attr.DefaultACL)
+	}
+	if attr.Tier != 0 {
+		w.Put8(uint8(attr.Tier))
 	}
 	logger.Tracef("attr: %+v -> %+v", attr, w.Bytes())
 	return w.Bytes()
@@ -230,6 +239,11 @@ func (attr *Attr) Unmarshal(buf []byte) {
 	if rb.Left() >= 8 {
 		attr.AccessACL = rb.Get32()
 		attr.DefaultACL = rb.Get32()
+	}
+	if rb.Left() >= 1 {
+		attr.Tier = rb.Get8()
+	} else {
+		attr.Tier = 0
 	}
 	logger.Tracef("attr: %+v -> %+v", buf, attr)
 }
@@ -397,7 +411,7 @@ type Meta interface {
 	// CleanStaleSessions cleans up sessions not active for more than 5 minutes
 	CleanStaleSessions(ctx Context)
 	// CleanupTrashBefore deletes all files in trash before the given time.
-	CleanupTrashBefore(ctx Context, edge time.Time, increProgress func(int))
+	CleanupTrashBefore(ctx Context, edge time.Time, increProgress func(int), stats *CleanupTrashStats) syscall.Errno
 	// CleanupDetachedNodesBefore deletes all detached nodes before the given time.
 	CleanupDetachedNodesBefore(ctx Context, edge time.Time, increProgress func())
 
@@ -410,7 +424,7 @@ type Meta interface {
 	// Resolve fetches the inode and attributes for an entry identified by the given path.
 	// ENOTSUP will be returned if there's no natural implementation for this operation or
 	// if there are any symlink following involved.
-	Resolve(ctx Context, parent Ino, path string, inode *Ino, attr *Attr) syscall.Errno
+	Resolve(ctx Context, parent Ino, path string, inode *Ino, attr *Attr, force bool) syscall.Errno
 	// GetAttr returns the attributes for given node.
 	GetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno
 	// SetAttr updates the attributes for given node.
@@ -432,6 +446,8 @@ type Meta interface {
 	// Unlink removes a file entry from a directory.
 	// The file will be deleted if it's not linked by any entries and not open by any sessions.
 	Unlink(ctx Context, parent Ino, name string, skipCheckTrash ...bool) syscall.Errno
+	// BatchUnlink remove some file entries from the same directory
+	BatchUnlink(ctx Context, parent Ino, entries []*Entry, count *uint64, skipCheckTrash bool) syscall.Errno
 	// Rmdir removes an empty sub-directory.
 	Rmdir(ctx Context, parent Ino, name string, skipCheckTrash ...bool) syscall.Errno
 	// Rename move an entry from a source directory to another with given name.
@@ -495,11 +511,11 @@ type Meta interface {
 	// GetTreeSummary returns a summary in tree structure
 	GetTreeSummary(ctx Context, root *TreeSummary, depth, topN uint8, strict bool, updateProgress func(count uint64, bytes uint64)) syscall.Errno
 	// Clone a file or directory
-	Clone(ctx Context, srcParentIno, srcIno, dstParentIno Ino, dstName string, cmode uint8, cumask uint16, count, total *uint64) syscall.Errno
+	Clone(ctx Context, srcParentIno, srcIno, dstParentIno Ino, dstName string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno
 	// GetPaths returns all paths of an inode
 	GetPaths(ctx Context, inode Ino) []string
 	// Check integrity of an absolute path and repair it if asked
-	Check(ctx Context, fpath string, repair bool, recursive bool, statAll bool) error
+	Check(ctx Context, fpath string, opt *CheckOpt) error
 	// Change root to a directory specified by subdir
 	Chroot(ctx Context, subdir string) syscall.Errno
 	// chroot set the root directory by inode
@@ -512,7 +528,7 @@ type Meta interface {
 	// OnReload register a callback for any change founded after reloaded.
 	OnReload(func(new *Format))
 
-	HandleQuota(ctx Context, cmd uint8, dpath string, uid uint32, gid uint32, quotas map[string]*Quota, strict, repair bool, create bool) error
+	HandleQuota(ctx Context, cmd uint8, qkey string, qtype uint32, quotas map[string]*Quota, strict, repair bool, create bool) error
 	//Triggers a global user group quota scan
 	ScanUserGroupUsage(ctx Context) error
 
@@ -526,9 +542,32 @@ type Meta interface {
 	// getBase return the base engine.
 	getBase() *baseMeta
 	InitMetrics(registerer prometheus.Registerer)
+	InitSharedMetrics(registerer prometheus.Registerer)
 
 	SetFacl(ctx Context, ino Ino, aclType uint8, n *aclAPI.Rule) syscall.Errno
 	GetFacl(ctx Context, ino Ino, aclType uint8, n *aclAPI.Rule) syscall.Errno
+
+	// kerberos
+	StoreToken(ctx Context, token []byte) (id uint32, st syscall.Errno)
+	UpdateToken(ctx Context, id uint32, token []byte) syscall.Errno
+	LoadToken(ctx Context, id uint32) (token []byte, st syscall.Errno)
+	DeleteTokens(ctx Context, ids []uint32) syscall.Errno
+	ListTokens(ctx Context) (tokens map[uint32][]byte, st syscall.Errno)
+
+	ScanChangelog(ctx Context, last int64, handler func(ver int64, entry string) error) error
+}
+
+type CheckOpt struct {
+	Repair        bool
+	Recursive     bool
+	SyncDirStat   bool
+	RepairDirMode uint16
+	ShowProgress  func(n int)
+	Slices        map[Ino][]Slice
+}
+
+type CleanupTrashStats struct {
+	DeletedFiles int64
 }
 
 type Creator func(driver, addr string, conf *Config) (Meta, error)
@@ -539,7 +578,7 @@ func Register(name string, register Creator) {
 	metaDrivers[name] = register
 }
 
-func setPasswordFromEnv(uri string) (string, error) {
+func injectPasswordIntoURI(uri, password string) (string, error) {
 	atIndex := strings.LastIndex(uri, "@")
 	if atIndex == -1 {
 		return "", fmt.Errorf("invalid uri: %s", uri)
@@ -554,8 +593,35 @@ func setPasswordFromEnv(uri string) (string, error) {
 	if len(s) == 2 && s[1] != "" {
 		return uri, nil
 	}
-	pwd := url.UserPassword("", os.Getenv("META_PASSWORD")) // escape only password
+	pwd := url.UserPassword("", password) // escape only password
 	return uri[:dIndex] + s[0] + pwd.String() + uri[atIndex:], nil
+}
+
+func readPasswordFromFile(filePath string) (string, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read password file %s: %w", filePath, err)
+	}
+	return strings.TrimSpace(string(content)), nil
+}
+
+func setPasswordFromEnv(uri string) (string, error) {
+	var password string
+	var err error
+
+	if metaPassword := os.Getenv("META_PASSWORD"); metaPassword != "" {
+		password = metaPassword
+	} else if passwordFile := os.Getenv("META_PASSWORD_FILE"); passwordFile != "" {
+		password, err = readPasswordFromFile(passwordFile)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		// No password source available, return original URI
+		return uri, nil
+	}
+
+	return injectPasswordIntoURI(uri, password)
 }
 
 // NewClient creates a Meta client for given uri.
@@ -569,9 +635,9 @@ func NewClient(uri string, conf *Config) Meta {
 		logger.Fatalf("invalid uri: %s", uri)
 	}
 	driver := uri[:p]
-	if os.Getenv("META_PASSWORD") != "" && (driver == "mysql" || driver == "postgres") {
+	if driver == "mysql" || driver == "postgres" {
 		if uri, err = setPasswordFromEnv(uri); err != nil {
-			logger.Fatalf(err.Error())
+			logger.Fatal(err.Error())
 		}
 	}
 	logger.Infof("Meta address: %s", utils.RemovePassword(uri))

@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,6 +37,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/pkg/bucket/policy"
 	"github.com/minio/minio/pkg/madmin"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/google/uuid"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
@@ -59,6 +61,7 @@ var logger = utils.GetLogger("juicefs")
 
 type Config struct {
 	MultiBucket bool
+	Bucket      string
 	KeepEtag    bool
 	Umask       uint16
 	ObjTag      bool
@@ -69,8 +72,8 @@ type Config struct {
 }
 
 func NewJFSGateway(jfs *fs.FileSystem, conf *vfs.Config, gConf *Config) (minio.ObjectLayer, error) {
-	mctx = meta.NewContext(uint32(os.Getpid()), uint32(os.Getuid()), []uint32{uint32(os.Getgid())})
-	jfsObj := &jfsObjects{fs: jfs, conf: conf, listPool: minio.NewTreeWalkPool(time.Minute * 30), gConf: gConf, nsMutex: minio.NewNSLock(false)}
+	mctx = meta.NewContext(uint32(os.Getpid()), uint32(utils.GetCurrentUID()), []uint32{uint32(utils.GetCurrentGID())})
+	jfsObj := &jfsObjects{fs: jfs, conf: conf, listPool: minio.NewTreeWalkPool(time.Second * 10), gConf: gConf, nsMutex: minio.NewNSLock(false)}
 	go jfsObj.cleanup()
 	return jfsObj, nil
 }
@@ -174,14 +177,14 @@ func (n *jfsObjects) isValidBucketName(bucket string) error {
 	if s3utils.CheckValidBucketNameStrict(bucket) != nil {
 		return minio.BucketNameInvalid{Bucket: bucket}
 	}
-	if !n.gConf.MultiBucket && bucket != n.conf.Format.Name {
+	if !n.gConf.MultiBucket && bucket != n.gConf.Bucket {
 		return minio.BucketNotFound{Bucket: bucket}
 	}
 	return nil
 }
 
 func (n *jfsObjects) path(p ...string) string {
-	if !n.gConf.MultiBucket && len(p) > 0 && p[0] == n.conf.Format.Name {
+	if !n.gConf.MultiBucket && len(p) > 0 && p[0] == n.gConf.Bucket {
 		p = p[1:]
 	}
 	return sep + minio.PathJoin(p...)
@@ -266,7 +269,7 @@ func (n *jfsObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketInf
 			return nil, jfsToObjectErr(ctx, eno)
 		}
 		buckets = []minio.BucketInfo{{
-			Name:    n.conf.Format.Name,
+			Name:    n.gConf.Bucket,
 			Created: time.Unix(fi.Atime()/1000, 0),
 		}}
 		return buckets, nil
@@ -339,21 +342,10 @@ func (n *jfsObjects) listDirFactory() minio.ListDirFunc {
 					continue
 				}
 			}
-			entry := &minio.Entry{Name: fi.Name(),
-				Info: &minio.ObjectInfo{
-					Bucket:   bucket,
-					Name:     fi.Name(),
-					ModTime:  fi.ModTime(),
-					Size:     fi.Size(),
-					IsDir:    fi.IsDir(),
-					AccTime:  fi.ModTime(),
-					IsLatest: true,
-				},
-			}
+			entry := &minio.Entry{Name: fi.Name(), Info: fi}
 
 			if fi.IsDir() {
 				entry.Name += sep
-				entry.Info.Size = 0
 			}
 			entries = append(entries, entry)
 		}
@@ -383,9 +375,10 @@ func (n *jfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, de
 	if err := n.checkBucket(ctx, bucket); err != nil {
 		return loi, err
 	}
-	getObjectInfo := func(ctx context.Context, bucket, object string, info *minio.ObjectInfo) (obj minio.ObjectInfo, err error) {
+	getObjectInfo := func(ctx context.Context, bucket, object string, fi_ any) (obj minio.ObjectInfo, err error) {
 		var eno syscall.Errno
-		if info == nil {
+		var info *minio.ObjectInfo
+		if fi_ == nil {
 			var fi *fs.FileStat
 			fi, eno = n.fs.Stat(mctx, n.path(bucket, object))
 			if eno == 0 {
@@ -415,6 +408,20 @@ func (n *jfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, de
 					IsLatest: true,
 				}
 				eno = 0
+			}
+		} else {
+			fi := fi_.(*fs.FileStat)
+			info = &minio.ObjectInfo{
+				Bucket:   bucket,
+				Name:     fi.Name(),
+				ModTime:  fi.ModTime(),
+				Size:     fi.Size(),
+				IsDir:    fi.IsDir(),
+				AccTime:  fi.ModTime(),
+				IsLatest: true,
+			}
+			if fi.IsDir() {
+				info.Size = 0
 			}
 		}
 
@@ -474,14 +481,20 @@ func (n *jfsObjects) DeleteObject(ctx context.Context, bucket, object string, op
 	if err = n.checkBucket(ctx, bucket); err != nil {
 		return
 	}
+	err = n.delObj(bucket, object)
 	info.Bucket = bucket
 	info.Name = object
+	return info, jfsToObjectErr(ctx, err, bucket, object)
+}
+
+func (n *jfsObjects) delObj(bucket string, object string) error {
 	p := path.Clean(n.path(bucket, object))
 	root := n.path(bucket)
 	if strings.HasSuffix(object, sep) {
 		// reset atime
 		n.setFileAtime(p, time.Now().Unix())
 	}
+	var err error
 	for p != root {
 		if eno := n.fs.Delete(mctx, p); eno != 0 {
 			if fs.IsNotEmpty(eno) || fs.IsNotExist(eno) {
@@ -496,20 +509,51 @@ func (n *jfsObjects) DeleteObject(ctx context.Context, bucket, object string, op
 			break
 		}
 	}
-	return info, jfsToObjectErr(ctx, err, bucket, object)
+	return err
 }
 
 func (n *jfsObjects) DeleteObjects(ctx context.Context, bucket string, objects []minio.ObjectToDelete, options minio.ObjectOptions) (objs []minio.DeletedObject, errs []error) {
 	objs = make([]minio.DeletedObject, len(objects))
 	errs = make([]error, len(objects))
-	for idx, object := range objects {
-		_, errs[idx] = n.DeleteObject(ctx, bucket, object.ObjectName, options)
-		if errs[idx] == nil {
-			objs[idx] = minio.DeletedObject{
-				ObjectName: object.ObjectName,
-			}
+	if err := n.checkBucket(ctx, bucket); err != nil {
+		for idx := range objects {
+			errs[idx] = minio.BucketNotFound{Bucket: bucket}
 		}
+		return
 	}
+	delMap := make(map[string][]int)
+	for idx, o := range objects {
+		p := path.Dir(path.Clean(n.path(bucket, o.ObjectName)))
+		delMap[p] = append(delMap[p], idx)
+	}
+	var g errgroup.Group
+	g.SetLimit(runtime.NumCPU())
+	for ppath := range delMap {
+		ppath := ppath
+		idxs := delMap[ppath]
+		ps := make([]string, len(idxs))
+		for i, idx := range idxs {
+			ps[i] = n.path(bucket, objects[idx].ObjectName)
+		}
+		g.Go(func() error {
+			// will ignore dir
+			err := n.fs.BatchDeleteEntries(mctx, ppath, ps)
+			if err != 0 {
+				for _, idx := range idxs {
+					errs[idx] = jfsToObjectErr(ctx, err, bucket, objects[idx].ObjectName)
+				}
+				return err
+			}
+			if e := n.delObj(bucket, ppath); e != nil {
+				for _, idx := range idxs {
+					errs[idx] = e
+				}
+				return err
+			}
+			return err
+		})
+	}
+	_ = g.Wait()
 	return
 }
 
@@ -667,7 +711,7 @@ func (n *jfsObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 	} else if !strings.HasSuffix(object, sep) && !fi.IsDir() {
 		isObject = true
 	}
-	if !n.gConf.HeadDir && !isObject {
+	if !n.gConf.HeadDir && !isObject || (strings.HasSuffix(object, sep) && !fi.IsDir()) {
 		err = jfsToObjectErr(ctx, syscall.ENOENT, bucket, object)
 		return
 	}
@@ -1059,6 +1103,9 @@ func (n *jfsObjects) ListMultipartUploads(ctx context.Context, bucket string, pr
 }
 
 func (n *jfsObjects) checkUploadIDExists(ctx context.Context, bucket, object, uploadID string) (err error) {
+	if len(uploadID) < subDirPrefix {
+		return minio.InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
+	}
 	if err = n.checkBucket(ctx, bucket); err != nil {
 		return
 	}
@@ -1157,7 +1204,28 @@ func (n *jfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, object
 	if err = n.checkUploadIDExists(ctx, bucket, object, uploadID); err != nil {
 		return
 	}
-
+	g, ectx := errgroup.WithContext(ctx)
+	g.SetLimit(10)
+	for i := 0; i < len(parts); i++ {
+		i := i
+		g.Go(func() error {
+			select {
+			case <-ectx.Done():
+				return ectx.Err()
+			default:
+			}
+			ppath := n.ppath(bucket, uploadID, strconv.Itoa(parts[i].PartNumber))
+			etag, _ := n.fs.GetXattr(mctx, ppath, s3Etag)
+			if string(etag) != "" && string(etag) != parts[i].ETag {
+				logger.Warnf("path: %s,expect etag: %s,but got: %s", ppath, etag, parts[i].ETag)
+				return minio.ErrInvalidEtag
+			}
+			return nil
+		})
+	}
+	if err = g.Wait(); err != nil {
+		return objInfo, err
+	}
 	tmp := n.ppath(bucket, uploadID, "complete")
 	_ = n.fs.Delete(mctx, tmp)
 	f, eno := n.fs.Create(mctx, tmp, 0666, n.gConf.Umask)
@@ -1190,7 +1258,7 @@ func (n *jfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, object
 	if n.gConf.KeepEtag {
 		eno = n.fs.SetXattr(mctx, tmp, s3Etag, []byte(s3MD5), 0)
 		if eno != 0 {
-			logger.Warnf("set xattr error, path: %s,xattr: %s,value: %s,flags: %d", tmp, s3Etag, s3MD5, 0)
+			logger.Warnf("set xattr error, path: %s,xattr: %s,value: %s,flags: %d error: %s", tmp, s3Etag, s3MD5, 0, eno)
 		}
 	}
 
@@ -1457,7 +1525,23 @@ func (n *jfsObjects) ListObjectVersions(ctx context.Context, bucket, prefix, mar
 	return loi, err
 }
 
-func (n *jfsObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object string, info *minio.ObjectInfo) (oi minio.ObjectInfo, e error) {
+func (n *jfsObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object string, info any) (oi minio.ObjectInfo, e error) {
+	if info != nil {
+		fi := info.(*fs.FileStat)
+		oi = minio.ObjectInfo{
+			Bucket:   bucket,
+			Name:     object,
+			ModTime:  fi.ModTime(),
+			Size:     fi.Size(),
+			IsDir:    fi.IsDir(),
+			AccTime:  fi.ModTime(),
+			IsLatest: true,
+		}
+		if fi.IsDir() {
+			oi.Size = 0
+		}
+		return
+	}
 	return n.GetObjectInfo(ctx, bucket, object, minio.ObjectOptions{})
 }
 
